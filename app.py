@@ -187,13 +187,15 @@ def build_ui() -> gr.Blocks:
                              "20–40 — заметный блюр, 60+ — однородное пятно.",
                     )
                     segmenter = gr.Radio(
-                        choices=["sam3", "sapiens", "segformer"],
-                        value="sam3",
+                        choices=["hybrid", "sam3", "sapiens", "segformer"],
+                        value="hybrid",
                         label="Сегментатор (с автоматическим fallback)",
-                        info="sam3 — Meta SAM 3 / 3.1 через официальный пакет, "
-                             "open-vocabulary, промпт «hair»; "
-                             "sapiens — резерв на Sapiens; segformer — лёгкий резерв. "
-                             "Падение → каскадный переход.",
+                        info="hybrid — Sapiens (тело и волосы) + SAM 3 (силуэт «woman»). "
+                             "Лучший выбор для modesty: точные руки/ноги/торс + "
+                             "мужчин не трогает. "
+                             "sam3 — только SAM 3 с текстовыми промптами. "
+                             "sapiens — Sapiens без gender-фильтра. "
+                             "segformer — лёгкий резерв (только волосы).",
                     )
                     sam3_version = gr.Radio(
                         choices=["sam3.1", "sam3"],

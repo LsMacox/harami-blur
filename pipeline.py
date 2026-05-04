@@ -451,6 +451,71 @@ class FeatherMatter:
         return np.asarray(pil, dtype=np.float32) / 255.0
 
 
+# ───────────────────────── Hybrid: Sapiens body + SAM 3 gender ──────────
+
+class HybridSegmenter:
+    """Best-quality modesty segmenter for mixed-gender / multi-person photos.
+
+    body  = Sapiens parsing (mode-specific class set: hair + skin classes)
+    gender = SAM 3 silhouette of `restrict_to` (default "woman")
+    final = body ∩ gender, plus an optional SAM 3 "hair" pass union'd into
+    the body mask before intersection (Sapiens hair coverage is uneven on
+    portraits; SAM 3 hair is reliably strong).
+    """
+
+    def __init__(self,
+                 sapiens_size: str = "1b",
+                 device: str | None = None,
+                 mode: str = "modesty",
+                 sam3_version: str = "sam3.1",
+                 restrict_to: str = "woman",
+                 strengthen_hair: bool = True):
+        self.body = SapiensSegmenter(
+            size=sapiens_size,
+            device=device,
+            target_classes=SAPIENS_CLASS_SETS[mode],
+        )
+        # SAM 3 here is just for the silhouette and (optionally) hair —
+        # passing the targets dict so it doesn't multi-prompt.
+        sam3_targets = ["hair"] if strengthen_hair else []
+        self.sam3 = Sam3Segmenter(
+            device=device,
+            version=sam3_version,
+            text_prompt={"targets": sam3_targets or [restrict_to],
+                         "restrict_to": None},
+        )
+        self.restrict_to = restrict_to
+        self.strengthen_hair = strengthen_hair
+        self.name = (
+            f"hybrid:{self.body.name}+{self.sam3.version}"
+            f"@{restrict_to}"
+        )
+
+    def segment(self, image: Image.Image) -> np.ndarray:
+        body_mask = self.body.segment(image)
+
+        # Single SAM 3 image-encode reused for both prompts.
+        state = self.sam3.processor.set_image(image)
+        if self.strengthen_hair:
+            sam3_hair = self.sam3._run_prompt_on_state(
+                state, "hair", image.height, image.width
+            )
+        else:
+            sam3_hair = np.zeros((image.height, image.width), dtype=bool)
+        gender = self.sam3._run_prompt_on_state(
+            state, self.restrict_to, image.height, image.width
+        )
+
+        if gender.mean() < 1e-4:
+            log.warning(
+                f"hybrid: '{self.restrict_to}' silhouette empty; returning empty mask"
+            )
+            return np.zeros((image.height, image.width), dtype=np.uint8)
+
+        target = (body_mask > 127) | sam3_hair
+        return ((target & gender).astype(np.uint8) * 255)
+
+
 # ───────────────────────── builders with fallback ─────────────────────────
 
 PIPELINE_MODES = ("hair", "modesty")
@@ -472,7 +537,15 @@ def build_segmenter(prefer: str = "sam3", sapiens_size: str = "2b",
     if mode not in PIPELINE_MODES:
         raise ValueError(f"unknown mode {mode!r}; valid: {PIPELINE_MODES}")
 
-    if prefer == "sam3":
+    if prefer == "hybrid":
+        # Hybrid only makes sense for modesty (it's body parsing + gender).
+        if mode != "modesty":
+            log.warning("hybrid segmenter is for modesty mode; falling back "
+                        "to sam3 since mode is hair-only")
+            chain = ["sam3", "sapiens", "segformer"]
+        else:
+            chain = ["hybrid", "sam3", "sapiens"]
+    elif prefer == "sam3":
         chain = ["sam3", "sapiens", "segformer"]
     elif prefer == "sapiens":
         chain = ["sapiens", "segformer"]
@@ -487,12 +560,18 @@ def build_segmenter(prefer: str = "sam3", sapiens_size: str = "2b",
         # mode and mislead the user. Drop it.
         chain = [c for c in chain if c != "segformer"]
         if not chain:
-            raise RuntimeError("modesty mode requires sapiens or sam3, "
-                               "but the user-chosen segmenter is segformer")
+            raise RuntimeError("modesty mode requires sapiens / sam3 / hybrid")
 
     last_err: Exception | None = None
     for choice in chain:
         try:
+            if choice == "hybrid":
+                return HybridSegmenter(
+                    sapiens_size=sapiens_size,
+                    device=device,
+                    mode=mode,
+                    sam3_version=sam3_version,
+                )
             if choice == "sam3":
                 return Sam3Segmenter(
                     device=device,

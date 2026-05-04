@@ -20,8 +20,10 @@ def main() -> None:
                    choices=list(SAPIENS_CHECKPOINTS.keys()),
                    help="Sapiens-seg variant; bigger = more accurate, more VRAM")
     p.add_argument("--segmenter", default="sam3",
-                   choices=["sam3", "sapiens", "segformer"],
-                   help="Force a segmenter; falls back automatically on load failure")
+                   choices=["hybrid", "sam3", "sapiens", "segformer"],
+                   help="Force a segmenter; falls back automatically on load "
+                        "failure. 'hybrid' = Sapiens body + SAM 3 woman "
+                        "silhouette, recommended for modesty.")
     p.add_argument("--sam3-version", default="sam3.1",
                    choices=["sam3", "sam3.1"],
                    help="Which SAM 3 checkpoint to use via Meta's sam3 package")
