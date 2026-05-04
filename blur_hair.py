@@ -16,7 +16,7 @@ def main() -> None:
     p.add_argument("output", type=Path)
     p.add_argument("--blur-radius", type=float, default=25.0,
                    help="Gaussian blur radius applied to the hair region")
-    p.add_argument("--sapiens-size", default="2b",
+    p.add_argument("--sapiens-size", default="1b",
                    choices=list(SAPIENS_CHECKPOINTS.keys()),
                    help="Sapiens-seg variant; bigger = more accurate, more VRAM")
     p.add_argument("--segmenter", default="sam3",

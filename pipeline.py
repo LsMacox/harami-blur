@@ -291,8 +291,8 @@ SAPIENS_CHECKPOINTS = {
              "sapiens_0.6b_goliath_best_goliath_mIoU_7777_epoch_178_torchscript.pt2"),
     "1b":   ("facebook/sapiens-seg-1b-torchscript",
              "sapiens_1b_goliath_best_goliath_mIoU_7994_epoch_151_torchscript.pt2"),
-    "2b":   ("facebook/sapiens-seg-2b-torchscript",
-             "sapiens_2b_goliath_best_goliath_mIoU_8129_epoch_200_torchscript.pt2"),
+    # Note: "2b" was removed — facebook/sapiens-seg-2b-torchscript no longer
+    # exists publicly on HF. Largest available torchscript variant is 1b.
 }
 
 
@@ -308,7 +308,7 @@ def _letterbox(image: Image.Image, target_h: int, target_w: int):
 
 
 class SapiensSegmenter:
-    def __init__(self, size: str = "2b", device: str | None = None,
+    def __init__(self, size: str = "1b", device: str | None = None,
                  target_classes: set[str] | None = None):
         from huggingface_hub import hf_hub_download
 
@@ -521,7 +521,7 @@ class HybridSegmenter:
 PIPELINE_MODES = ("hair", "modesty")
 
 
-def build_segmenter(prefer: str = "sam3", sapiens_size: str = "2b",
+def build_segmenter(prefer: str = "sam3", sapiens_size: str = "1b",
                     device: str | None = None,
                     sam3_version: str = "sam3.1",
                     mode: str = "hair") -> Segmenter:
@@ -648,7 +648,7 @@ class HairBlurPipeline:
     def __init__(self,
                  segmenter: Segmenter | None = None,
                  matter: Matter | None = None,
-                 sapiens_size: str = "2b",
+                 sapiens_size: str = "1b",
                  prefer_segmenter: str = "sam3",
                  prefer_matter: str = "matanyone",
                  device: str | None = None,

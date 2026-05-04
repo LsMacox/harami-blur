@@ -207,7 +207,7 @@ def build_ui() -> gr.Blocks:
                     )
                     sapiens_size = gr.Dropdown(
                         choices=list(SAPIENS_CHECKPOINTS.keys()),
-                        value="2b",
+                        value="1b",
                         label="Размер модели Sapiens (используется в fallback)",
                         info="Срабатывает только если SAM 3 не загрузится. "
                              "2b — максимум точности (~8 ГБ); 1b — баланс (~4 ГБ).",
