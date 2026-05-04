@@ -1,11 +1,15 @@
-"""Hair-aware blur pipeline (modular, with graceful fallbacks).
+"""Modesty-aware blur pipeline (modular, with graceful fallbacks).
 
-Primary path:    SAM 3 (text="hair")  →  MatAnyone   →  alpha-blended Gaussian blur
-Fallback chain:  Sapiens-seg-2B  →  SegFormer face-parsing
+Primary path:    Hybrid (Sapiens body + SAM 3 woman silhouette)
+                 → MatAnyone → alpha-blended Gaussian blur
+Fallback chain:  SAM 3 multi-prompt → Sapiens body classes
 Matter fallback: MatAnyone  →  feathered binary mask
 
 The pipeline always returns an output, mask and alpha — even if every "heavy"
 dependency is missing — so the UI never throws at the user.
+
+There is exactly one mode: blur hair + every exposed-skin body class on
+detected women, leave face / clothing / background untouched.
 """
 
 from __future__ import annotations
@@ -238,51 +242,34 @@ SAPIENS_CLASSES = (
 SAPIENS_NAME_TO_IDX = {n: i for i, n in enumerate(SAPIENS_CLASSES)}
 SAPIENS_HAIR_CLASS = SAPIENS_NAME_TO_IDX["Hair"]
 
-# Class sets per pipeline mode. "modesty" blurs hair + exposed-skin classes
-# but leaves Face_Neck (face) and clothing classes visible.
-SAPIENS_CLASS_SETS: dict[str, set[str]] = {
-    "hair": {"Hair"},
-    "modesty": {
-        "Hair", "Torso",
-        "Left_Hand", "Left_Foot", "Left_Lower_Arm", "Left_Upper_Arm",
-        "Left_Lower_Leg", "Left_Upper_Leg",
-        "Right_Hand", "Right_Foot", "Right_Lower_Arm", "Right_Upper_Arm",
-        "Right_Lower_Leg", "Right_Upper_Leg",
-    },
+# Modesty class set — blurs hair + every exposed-skin body class but leaves
+# Face_Neck (face) and clothing classes visible.
+SAPIENS_MODESTY_CLASSES: set[str] = {
+    "Hair", "Torso",
+    "Left_Hand", "Left_Foot", "Left_Lower_Arm", "Left_Upper_Arm",
+    "Left_Lower_Leg", "Left_Upper_Leg",
+    "Right_Hand", "Right_Foot", "Right_Lower_Arm", "Right_Upper_Arm",
+    "Right_Lower_Leg", "Right_Upper_Leg",
 }
 
-# SAM 3 prompt configuration per pipeline mode.
-#   targets:     prompts whose masks are union'd to form what gets blurred
-#   restrict_to: optional silhouette prompt — final mask is target ∩ this.
-#                Used for gender-aware modesty so men's hair / clothing
-#                in mixed-gender photos isn't blurred.
-SAM3_PROMPT_SETS: dict[str, dict] = {
-    "hair": {
-        "targets": ["hair"],
-        "restrict_to": None,
-    },
-    "modesty": {
-        # Simple noun prompts work best with SAM 3 (compound phrases like
-        # "hair on a woman" return ~0%). The `restrict_to` intersection
-        # with the "woman" silhouette is what filters out men. We avoid
-        # prompts that match the face (e.g. "exposed skin", "skin"); face
-        # remains visible by design — this matches typical hijab-style
-        # modesty rules where hair and body are covered but face isn't.
-        "targets": [
-            "hair",
-            "bare arms",
-            "bare shoulders",
-            "bare legs",
-            "thighs",
-            "midriff",
-            "neckline",
-            "cleavage",
-            "decolletage",
-            "exposed chest",
-        ],
-        "restrict_to": "woman",
-    },
-}
+# SAM 3 prompt set for modesty. Simple noun prompts work best with SAM 3
+# (compound phrases like "hair on a woman" return ~0%). The `restrict_to`
+# intersection with the "woman" silhouette filters out men. We avoid
+# prompts that match the face (e.g. "exposed skin", "skin") — face stays
+# visible by design, matching typical hijab-style modesty rules.
+SAM3_MODESTY_TARGETS: list[str] = [
+    "hair",
+    "bare arms",
+    "bare shoulders",
+    "bare legs",
+    "thighs",
+    "midriff",
+    "neckline",
+    "cleavage",
+    "decolletage",
+    "exposed chest",
+]
+SAM3_MODESTY_RESTRICT_TO: str = "woman"
 
 SAPIENS_CHECKPOINTS = {
     "0.3b": ("facebook/sapiens-seg-0.3b-torchscript",
@@ -316,9 +303,9 @@ class SapiensSegmenter:
             raise ValueError(f"unknown sapiens size {size!r}")
         self.size = size
         self.device = pick_device(device)
-        # Default target = just Hair (single-class behaviour).
+        # Default = the full modesty class set (hair + body skin).
         if target_classes is None:
-            target_classes = SAPIENS_CLASS_SETS["hair"]
+            target_classes = SAPIENS_MODESTY_CLASSES
         self.target_class_names = sorted(target_classes)
         unknown = set(target_classes) - set(SAPIENS_NAME_TO_IDX)
         if unknown:
@@ -456,29 +443,27 @@ class FeatherMatter:
 class HybridSegmenter:
     """Best-quality modesty segmenter for mixed-gender / multi-person photos.
 
-    body  = Sapiens parsing (mode-specific class set: hair + skin classes)
+    body   = Sapiens parsing (modesty class set: hair + skin classes)
+    SAM 3  = multi-prompt union (hair, bare arms/legs/..., neckline, ...)
     gender = SAM 3 silhouette of `restrict_to` (default "woman")
-    final = body ∩ gender, plus an optional SAM 3 "hair" pass union'd into
-    the body mask before intersection (Sapiens hair coverage is uneven on
-    portraits; SAM 3 hair is reliably strong).
+    final  = (body ∪ SAM 3) ∩ gender
     """
 
     def __init__(self,
                  sapiens_size: str = "1b",
                  device: str | None = None,
-                 mode: str = "modesty",
                  sam3_version: str = "sam3.1",
-                 restrict_to: str = "woman",
+                 restrict_to: str = SAM3_MODESTY_RESTRICT_TO,
                  sam3_targets: list[str] | None = None):
         self.body = SapiensSegmenter(
             size=sapiens_size,
             device=device,
-            target_classes=SAPIENS_CLASS_SETS[mode],
+            target_classes=SAPIENS_MODESTY_CLASSES,
         )
-        # SAM 3 prompts to run *in addition* to the Sapiens body parsing:
+        # SAM 3 prompts to run *in addition* to the Sapiens body parsing —
         # patch up things Sapiens misses on small bodies in crowded photos.
         if sam3_targets is None:
-            sam3_targets = list(SAM3_PROMPT_SETS[mode]["targets"])
+            sam3_targets = list(SAM3_MODESTY_TARGETS)
         self.sam3_targets: list[str] = sam3_targets
         # The Sam3Segmenter itself isn't used via .segment() here — we just
         # need its loaded model and processor for direct prompt calls.
@@ -522,49 +507,22 @@ class HybridSegmenter:
 
 # ───────────────────────── builders with fallback ─────────────────────────
 
-PIPELINE_MODES = ("hair", "modesty")
-
-
-def build_segmenter(prefer: str = "sam3", sapiens_size: str = "1b",
+def build_segmenter(prefer: str = "hybrid", sapiens_size: str = "1b",
                     device: str | None = None,
-                    sam3_version: str = "sam3.1",
-                    mode: str = "hair") -> Segmenter:
-    """Try the requested model first; cascade through fallbacks on failure.
+                    sam3_version: str = "sam3.1") -> Segmenter:
+    """Build a segmenter; cascade through fallbacks on init failure.
 
-    Default cascade order for prefer="sam3": sam3 → sapiens → segformer.
-    `mode` selects which classes / prompts the segmenter is configured for:
-        - "hair":     blur hair only
-        - "modesty":  blur hair + every exposed-skin body class.
-                      SegFormer face-parsing has no body classes, so on this
-                      mode it gets dropped from the fallback chain.
+    Pipeline only has the modesty mode now, so SegFormer (face-only) is
+    always dropped from the chain.
     """
-    if mode not in PIPELINE_MODES:
-        raise ValueError(f"unknown mode {mode!r}; valid: {PIPELINE_MODES}")
-
     if prefer == "hybrid":
-        # Hybrid only makes sense for modesty (it's body parsing + gender).
-        if mode != "modesty":
-            log.warning("hybrid segmenter is for modesty mode; falling back "
-                        "to sam3 since mode is hair-only")
-            chain = ["sam3", "sapiens", "segformer"]
-        else:
-            chain = ["hybrid", "sam3", "sapiens"]
+        chain = ["hybrid", "sam3", "sapiens"]
     elif prefer == "sam3":
-        chain = ["sam3", "sapiens", "segformer"]
+        chain = ["sam3", "sapiens"]
     elif prefer == "sapiens":
-        chain = ["sapiens", "segformer"]
-    elif prefer == "segformer":
-        chain = ["segformer"]
+        chain = ["sapiens"]
     else:
         raise ValueError(f"unknown segmenter {prefer!r}")
-
-    if mode == "modesty":
-        # SegFormer face-parsing knows about hair but not about arms / legs
-        # / torso, so it would silently produce a hair-only mask in modesty
-        # mode and mislead the user. Drop it.
-        chain = [c for c in chain if c != "segformer"]
-        if not chain:
-            raise RuntimeError("modesty mode requires sapiens / sam3 / hybrid")
 
     last_err: Exception | None = None
     for choice in chain:
@@ -573,23 +531,23 @@ def build_segmenter(prefer: str = "sam3", sapiens_size: str = "1b",
                 return HybridSegmenter(
                     sapiens_size=sapiens_size,
                     device=device,
-                    mode=mode,
                     sam3_version=sam3_version,
                 )
             if choice == "sam3":
                 return Sam3Segmenter(
                     device=device,
                     version=sam3_version,
-                    text_prompt=SAM3_PROMPT_SETS[mode],
+                    text_prompt={
+                        "targets": list(SAM3_MODESTY_TARGETS),
+                        "restrict_to": SAM3_MODESTY_RESTRICT_TO,
+                    },
                 )
             if choice == "sapiens":
                 return SapiensSegmenter(
                     size=sapiens_size,
                     device=device,
-                    target_classes=SAPIENS_CLASS_SETS[mode],
+                    target_classes=SAPIENS_MODESTY_CLASSES,
                 )
-            if choice == "segformer":
-                return SegFormerSegmenter(device=device)
         except Exception as e:
             log.warning(f"{choice} unavailable ({e}); trying next fallback")
             last_err = e
@@ -644,7 +602,6 @@ class BlurResult:
     segmenter: str             # which segmenter actually ran
     matter: str                # which matter actually ran
     coverage: float            # fraction of image flagged for blur (0..1)
-    mode: str                  # "hair" or "modesty"
     woman_check: float | None  # fraction "woman" was detected on, or None
 
 
@@ -653,18 +610,14 @@ class HairBlurPipeline:
                  segmenter: Segmenter | None = None,
                  matter: Matter | None = None,
                  sapiens_size: str = "1b",
-                 prefer_segmenter: str = "sam3",
+                 prefer_segmenter: str = "hybrid",
                  prefer_matter: str = "matanyone",
                  device: str | None = None,
                  feather_radius: float = 4.0,
-                 sam3_version: str = "sam3.1",
-                 mode: str = "hair"):
-        if mode not in PIPELINE_MODES:
-            raise ValueError(f"unknown mode {mode!r}; valid: {PIPELINE_MODES}")
-        self.mode = mode
+                 sam3_version: str = "sam3.1"):
         self.segmenter = segmenter or build_segmenter(
             prefer_segmenter, sapiens_size, device,
-            sam3_version=sam3_version, mode=mode,
+            sam3_version=sam3_version,
         )
         self.matter = matter or build_matter(prefer_matter, feather_radius)
 
@@ -706,6 +659,5 @@ class HairBlurPipeline:
             segmenter=self.segmenter.name,
             matter=self.matter.name,
             coverage=coverage,
-            mode=self.mode,
             woman_check=woman_cov,
         )

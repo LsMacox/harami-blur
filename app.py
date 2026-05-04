@@ -22,7 +22,6 @@ from PIL import Image
 
 from pipeline import (
     HairBlurPipeline,
-    PIPELINE_MODES,
     SAPIENS_CHECKPOINTS,
     pick_device,
 )
@@ -38,10 +37,10 @@ _PIPE_KEY: Optional[tuple] = None
 
 def get_pipeline(sapiens_size: str, segmenter: str, matter: str,
                  device: str, feather_radius: float,
-                 sam3_version: str, mode: str) -> HairBlurPipeline:
+                 sam3_version: str) -> HairBlurPipeline:
     global _PIPE, _PIPE_KEY
     key = (sapiens_size, segmenter, matter, device,
-           round(feather_radius, 2), sam3_version, mode)
+           round(feather_radius, 2), sam3_version)
     with _PIPE_LOCK:
         if _PIPE is None or _PIPE_KEY != key:
             _PIPE = HairBlurPipeline(
@@ -51,13 +50,12 @@ def get_pipeline(sapiens_size: str, segmenter: str, matter: str,
                 device=device,
                 feather_radius=feather_radius,
                 sam3_version=sam3_version,
-                mode=mode,
             )
             _PIPE_KEY = key
         return _PIPE
 
 
-def process(image, blur_radius, mode, segmenter, sapiens_size, sam3_version,
+def process(image, blur_radius, segmenter, sapiens_size, sam3_version,
             matter, feather_radius, device_choice, do_clean, check_woman,
             progress=gr.Progress(track_tqdm=False)):
     if image is None:
@@ -71,7 +69,7 @@ def process(image, blur_radius, mode, segmenter, sapiens_size, sam3_version,
 
     progress(0.05, desc="Загружаю модели…")
     pipe = get_pipeline(sapiens_size, segmenter, matter, device or "",
-                        feather_radius, sam3_version, mode)
+                        feather_radius, sam3_version)
 
     if check_woman:
         progress(0.2, desc="Проверяю, что на фото женщина…")
@@ -82,7 +80,6 @@ def process(image, blur_radius, mode, segmenter, sapiens_size, sam3_version,
     progress(1.0, desc="Готово")
 
     info_lines = [
-        f"**Режим:** `{result.mode}`",
         f"**Сегментатор:** `{result.segmenter}`",
         f"**Матирование:** `{result.matter}`",
         f"**Покрытие маски:** {result.coverage:.2%}",
@@ -91,7 +88,7 @@ def process(image, blur_radius, mode, segmenter, sapiens_size, sam3_version,
     if result.woman_check is not None:
         ok = "✓" if result.woman_check >= 0.01 else "⚠"
         info_lines.insert(
-            1, f"**Проверка «женщина»:** {ok} покрытие {result.woman_check:.2%}"
+            0, f"**Проверка «женщина»:** {ok} покрытие {result.woman_check:.2%}"
         )
     info = "  \n".join(info_lines)
     if result.coverage < 0.001:
@@ -109,48 +106,41 @@ PARAM_HELP = """
 ### Что настраивает каждый параметр
 
 - **Радиус блюра** — сила размытия в пикселях. Малые значения (5–15) только
-  смягчают волосы; средние (20–40) дают заметный «motion-blur»; большие
-  (60–100) превращают волосы в почти однородное цветное пятно.
-- **Сегментатор** — какая нейросеть выделяет волосы. Цепочка fallback —
-  если выбранный не загрузится, автоматически переключится на следующий:
-  - `sam3` — Meta SAM 3 / 3.1, open-vocabulary, текстовый промпт «hair».
-    Загружается через официальный пакет `facebookresearch/sam3`. Веса
-    гейтед: нужен HF-токен и одобренный доступ на `facebook/sam3.1`
-    (или `facebook/sam3` для старой версии).
-  - `sapiens` — Meta Sapiens (ECCV 2024), обученная только на людях.
-    Очень точна на сложных причёсках; не требует доступа.
-  - `segformer` — `jonathandinu/face-parsing` (B5). Лёгкий, быстрый,
-    маска грубее.
+  смягчают переход; средние (20–40) дают заметный «motion-blur»; большие
+  (60–100) превращают зону в однородное пятно.
+- **Сегментатор** — какая нейросеть строит маску волос+кожи на женщинах.
+  Цепочка fallback — если выбранный не загрузится, переключится на следующий:
+  - `hybrid` (рекомендуется): Sapiens (28-классовое body parsing) +
+    SAM 3 multi-prompt (hair, bare arms, bare legs, …) + SAM 3 силуэт
+    «woman» как gender-фильтр. Мужчин не трогает.
+  - `sam3` — только SAM 3 с текстовыми промптами и intersect с «woman».
+    Без Sapiens хуже ловит руки/ноги в крупных сценах.
+  - `sapiens` — только Sapiens без gender-фильтра (мужчин тоже размоет).
 - **Версия SAM 3** — `sam3.1` (март 2026, Object Multiplex, лучше для
-  видео) или `sam3` (ноябрь 2025, оригинал). На статичном фото разница
-  околонулевая.
-- **Размер Sapiens** — нужен только если SAM 3 недоступен и пайплайн
-  упал на Sapiens. `2b` самая точная (≈8 ГБ весов), `1b` — компромисс
-  (≈4 ГБ), `0.6b` / `0.3b` — для слабого железа.
-- **Матирование** — что делает с границей маски для плавного перехода:
-  - `matanyone` — нейросетевой alpha-matting (CVPR 2025). Обрабатывает
-    отдельные пряди и пушок, переход естественный.
-  - `feather` — простое гауссово размытие самой маски; работает всегда,
-    но края «мыльные».
-- **Feather радиус** — сила размытия для fallback-матирования. На MatAnyone
-  не влияет.
-- **Устройство** — `auto` выберет CUDA → MPS → CPU. Принудительно `cpu`
-  ставить только при ошибках на GPU.
-- **Чистить маску** — пост-обработка через OpenCV: удаляет точечный шум
-  и закрывает дыры. Обычно стоит держать включённым.
+  видео) или `sam3` (ноябрь 2025). На фото разница околонулевая.
+- **Размер Sapiens** — `1b` (баланс, ~4 ГБ), `0.6b` / `0.3b` для
+  слабого железа. 2B-вариант недоступен публично на HF.
+- **Матирование** — что делает с границей маски:
+  - `matanyone` — нейросетевой alpha-matting (CVPR 2025). Плавные пряди.
+  - `feather` — простое размытие маски, быстрее но грубее.
+- **Feather радиус** — для fallback-матирования. На matanyone не влияет.
+- **Устройство** — для SAM 3 на Mac жёстко нужен `cpu` (Metal падает
+  на mixed-dtype matmul). Sapiens сам по себе ходит на MPS.
+- **Чистить маску** — морфологический cleanup через OpenCV.
 """
 
 
 def build_ui() -> gr.Blocks:
-    with gr.Blocks(title="Harami Hair Blur", theme=gr.themes.Soft()) as demo:
+    with gr.Blocks(title="Harami Modesty Blur", theme=gr.themes.Soft()) as demo:
         gr.Markdown(
-            "## 🪞 Harami Hair Blur\n"
-            "Сегментирует волосы человека на фотографии и аккуратно размывает их.  \n"
-            "Стек: **SAM 3.1** (Meta, март 2026) с текстовым промптом «hair» "
-            "через официальный пакет `facebookresearch/sam3` + "
-            "**MatAnyone** (CVPR 2025) для alpha-matting на отдельных прядях.  \n"
-            "Каскадный fallback: SAM 3 → Sapiens → SegFormer, "
-            "и MatAnyone → feather, чтобы интерфейс всегда отвечал."
+            "## 🪞 Harami Modesty Blur\n"
+            "Размывает волосы и любые открытые участки кожи у женщин на фото "
+            "(плечи, руки, шея, ноги, торс). Лицо остаётся чётким, мужчины "
+            "не затрагиваются.  \n"
+            "Стек: **Sapiens-1B** (28-класс body parsing) + "
+            "**SAM 3.1** (мульти-промпт + силуэт «woman») + "
+            "**MatAnyone** (alpha-matting). "
+            "При сбое любого компонента работает каскадный fallback."
         )
 
         with gr.Row():
@@ -163,15 +153,6 @@ def build_ui() -> gr.Blocks:
                 )
 
                 with gr.Accordion("⚙ Настройки", open=True):
-                    mode = gr.Radio(
-                        choices=list(PIPELINE_MODES),
-                        value="hair",
-                        label="Режим",
-                        info="hair — размыть только волосы. "
-                             "modesty — размыть волосы + любые открытые "
-                             "участки кожи (плечи, руки, шея, ноги, торс). "
-                             "Лицо остаётся чётким. Не работает на segformer.",
-                    )
                     check_woman = gr.Checkbox(
                         value=False,
                         label="Сначала проверить, что на фото женщина",
@@ -187,15 +168,14 @@ def build_ui() -> gr.Blocks:
                              "20–40 — заметный блюр, 60+ — однородное пятно.",
                     )
                     segmenter = gr.Radio(
-                        choices=["hybrid", "sam3", "sapiens", "segformer"],
+                        choices=["hybrid", "sam3", "sapiens"],
                         value="hybrid",
                         label="Сегментатор (с автоматическим fallback)",
-                        info="hybrid — Sapiens (тело и волосы) + SAM 3 (силуэт «woman»). "
-                             "Лучший выбор для modesty: точные руки/ноги/торс + "
-                             "мужчин не трогает. "
+                        info="hybrid — Sapiens body + SAM 3 multi-prompt + "
+                             "SAM 3 силуэт «woman». Лучший выбор. "
                              "sam3 — только SAM 3 с текстовыми промптами. "
-                             "sapiens — Sapiens без gender-фильтра. "
-                             "segformer — лёгкий резерв (только волосы).",
+                             "sapiens — только Sapiens (без gender-фильтра — "
+                             "затронет и мужчин).",
                     )
                     sam3_version = gr.Radio(
                         choices=["sam3.1", "sam3"],
@@ -276,7 +256,7 @@ def build_ui() -> gr.Blocks:
 
         run_btn.click(
             process,
-            inputs=[inp, blur_radius, mode, segmenter, sapiens_size, sam3_version,
+            inputs=[inp, blur_radius, segmenter, sapiens_size, sam3_version,
                     matter, feather_radius, device_choice, do_clean, check_woman],
             outputs=[out_image, out_mask, out_alpha, info],
         )
