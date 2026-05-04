@@ -469,50 +469,54 @@ class HybridSegmenter:
                  mode: str = "modesty",
                  sam3_version: str = "sam3.1",
                  restrict_to: str = "woman",
-                 strengthen_hair: bool = True):
+                 sam3_targets: list[str] | None = None):
         self.body = SapiensSegmenter(
             size=sapiens_size,
             device=device,
             target_classes=SAPIENS_CLASS_SETS[mode],
         )
-        # SAM 3 here is just for the silhouette and (optionally) hair —
-        # passing the targets dict so it doesn't multi-prompt.
-        sam3_targets = ["hair"] if strengthen_hair else []
+        # SAM 3 prompts to run *in addition* to the Sapiens body parsing:
+        # patch up things Sapiens misses on small bodies in crowded photos.
+        if sam3_targets is None:
+            sam3_targets = list(SAM3_PROMPT_SETS[mode]["targets"])
+        self.sam3_targets: list[str] = sam3_targets
+        # The Sam3Segmenter itself isn't used via .segment() here — we just
+        # need its loaded model and processor for direct prompt calls.
         self.sam3 = Sam3Segmenter(
             device=device,
             version=sam3_version,
-            text_prompt={"targets": sam3_targets or [restrict_to],
-                         "restrict_to": None},
+            text_prompt={"targets": sam3_targets, "restrict_to": None},
         )
         self.restrict_to = restrict_to
-        self.strengthen_hair = strengthen_hair
         self.name = (
-            f"hybrid:{self.body.name}+{self.sam3.version}"
+            f"hybrid:{self.body.name}"
+            f"+{self.sam3.version}:{'+'.join(sam3_targets)}"
             f"@{restrict_to}"
         )
 
     def segment(self, image: Image.Image) -> np.ndarray:
         body_mask = self.body.segment(image)
 
-        # Single SAM 3 image-encode reused for both prompts.
+        # Single heavy ViT pass; everything below is cheap text-only forward.
         state = self.sam3.processor.set_image(image)
-        if self.strengthen_hair:
-            sam3_hair = self.sam3._run_prompt_on_state(
-                state, "hair", image.height, image.width
+
+        sam3_union = np.zeros((image.height, image.width), dtype=bool)
+        for prompt in self.sam3_targets:
+            log.info(f"hybrid sam3 target: {prompt!r}")
+            sam3_union |= self.sam3._run_prompt_on_state(
+                state, prompt, image.height, image.width
             )
-        else:
-            sam3_hair = np.zeros((image.height, image.width), dtype=bool)
+
         gender = self.sam3._run_prompt_on_state(
             state, self.restrict_to, image.height, image.width
         )
-
         if gender.mean() < 1e-4:
             log.warning(
                 f"hybrid: '{self.restrict_to}' silhouette empty; returning empty mask"
             )
             return np.zeros((image.height, image.width), dtype=np.uint8)
 
-        target = (body_mask > 127) | sam3_hair
+        target = (body_mask > 127) | sam3_union
         return ((target & gender).astype(np.uint8) * 255)
 
 
