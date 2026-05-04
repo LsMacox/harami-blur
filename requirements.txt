@@ -1,0 +1,13 @@
+torch>=2.7
+torchvision>=0.22
+pillow>=10.0
+numpy>=1.26
+huggingface_hub>=0.24
+opencv-python>=4.10
+# SAM 3 integration landed in transformers around 4.50; on bleeding-edge it
+# may live in v5.0 release candidates. If installed transformers lacks
+# Sam3Model, the pipeline silently falls back to Sapiens / SegFormer.
+transformers>=4.50
+gradio>=4.40
+# MatAnyone is shipped from git, not PyPI. Install separately for matting:
+#   pip install git+https://github.com/pq-yang/MatAnyone.git

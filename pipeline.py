@@ -1,0 +1,442 @@
+"""Hair-aware blur pipeline (modular, with graceful fallbacks).
+
+Primary path:    SAM 3 (text="hair")  →  MatAnyone   →  alpha-blended Gaussian blur
+Fallback chain:  Sapiens-seg-2B  →  SegFormer face-parsing
+Matter fallback: MatAnyone  →  feathered binary mask
+
+The pipeline always returns an output, mask and alpha — even if every "heavy"
+dependency is missing — so the UI never throws at the user.
+"""
+
+from __future__ import annotations
+
+import logging
+import shutil
+import tempfile
+from dataclasses import dataclass
+from pathlib import Path
+from typing import Protocol
+
+import numpy as np
+import torch
+from PIL import Image, ImageFilter
+
+log = logging.getLogger("harami-blur")
+log.setLevel(logging.INFO)
+if not log.handlers:
+    h = logging.StreamHandler()
+    h.setFormatter(logging.Formatter("[%(levelname)s] %(name)s: %(message)s"))
+    log.addHandler(h)
+
+
+# ───────────────────────── device helper ─────────────────────────
+
+def pick_device(preferred: str | None = None) -> str:
+    if preferred:
+        return preferred
+    if torch.cuda.is_available():
+        return "cuda"
+    if torch.backends.mps.is_available():
+        return "mps"
+    return "cpu"
+
+
+# ───────────────────────── protocols ─────────────────────────
+
+class Segmenter(Protocol):
+    name: str
+    def segment(self, image: Image.Image) -> np.ndarray: ...  # uint8 0/255 mask
+
+
+class Matter(Protocol):
+    name: str
+    def matte(self, image: Image.Image, mask: np.ndarray) -> np.ndarray: ...  # float32 [0,1]
+
+
+# ───────────────────────── SAM 3 segmenter (text-prompted) ─────────────────────────
+
+class Sam3Segmenter:
+    """Meta SAM 3 / 3.1 with text prompt 'hair'.
+
+    Uses Meta's official `sam3` Python package
+    (https://github.com/facebookresearch/sam3) which supports both:
+      • SAM 3   — `facebook/sam3`     (Nov 2025)
+      • SAM 3.1 — `facebook/sam3.1`   (Mar 2026, Object Multiplex)
+
+    Default version is "sam3.1" — same image-quality plus the better video
+    backbone for when we add video later. Pass `version="sam3"` to fall back
+    to the original.
+
+    Setup once:
+        git clone https://github.com/facebookresearch/sam3.git
+        cd sam3 && pip install -e .
+        hf download facebook/sam3.1            # gated, requires approval
+    """
+
+    def __init__(self,
+                 device: str | None = None,
+                 version: str = "sam3.1",
+                 text_prompt: str = "hair",
+                 checkpoint_path: str | None = None):
+        try:
+            from sam3.model_builder import (
+                build_sam3_image_model,
+                download_ckpt_from_hf,
+            )
+            from sam3.model.sam3_image_processor import Sam3Processor
+        except ImportError as exc:
+            raise RuntimeError(
+                "Meta `sam3` package not installed. Run:\n"
+                "  git clone https://github.com/facebookresearch/sam3.git\n"
+                "  cd sam3 && pip install -e ."
+            ) from exc
+
+        self.device = pick_device(device)
+        # SAM 3 / 3.1 internally use Metal-incompatible matmul dtype patterns
+        # that crash on MPS (verified on M-series Macs). Force CPU when the
+        # caller asked for MPS — better a slow result than a crash.
+        if self.device == "mps":
+            log.warning("SAM 3 not stable on MPS; running on CPU instead")
+            self.device = "cpu"
+        self.version = version
+        self.text_prompt = text_prompt
+        self.name = f"{version}:{text_prompt}"
+
+        # Meta's builder only branches on 'cuda'; everything else is CPU.
+        build_device = "cuda" if self.device == "cuda" else "cpu"
+
+        if checkpoint_path is None:
+            log.info(f"resolving {version} checkpoint via HF cache…")
+            checkpoint_path = download_ckpt_from_hf(version=version)
+
+        log.info(f"building {version} on {self.device} from {checkpoint_path}")
+        model = build_sam3_image_model(
+            device=build_device,
+            checkpoint_path=checkpoint_path,
+            load_from_HF=False,
+        )
+        # Some weights ship as bf16 (designed for CUDA autocast). On Mac
+        # CPU/MPS that triggers dtype mismatches (Float vs BFloat16). Coerce
+        # everything to float32 for consistent inference.
+        model = model.float()
+        if self.device == "mps":
+            try:
+                model = model.to("mps")
+            except Exception as e:
+                log.warning(f"MPS migration failed ({e}); staying on CPU")
+                self.device = "cpu"
+        self.model = model
+        # Force the processor to the same device as the model — its default
+        # auto-detect can pick MPS even when model is on CPU.
+        self.processor = Sam3Processor(model, device=self.device)
+
+    @torch.inference_mode()
+    def segment(self, image: Image.Image) -> np.ndarray:
+        state = self.processor.set_image(image)
+        output = self.processor.set_text_prompt(
+            state=state, prompt=self.text_prompt
+        )
+        masks = output.get("masks") if isinstance(output, dict) else None
+        union = np.zeros((image.height, image.width), dtype=bool)
+        if masks is None:
+            return union.astype(np.uint8) * 255
+
+        if isinstance(masks, torch.Tensor):
+            if masks.numel() == 0:
+                return union.astype(np.uint8) * 255
+            arr = masks.bool().cpu().numpy()
+            while arr.ndim > 3:
+                arr = arr[:, 0]      # squeeze [N, 1, H, W] → [N, H, W]
+            union = arr.any(axis=0)
+        else:
+            for m in masks:
+                a = m.cpu().numpy() if isinstance(m, torch.Tensor) else np.asarray(m)
+                while a.ndim > 2:
+                    a = a[0]
+                union |= a.astype(bool)
+        return union.astype(np.uint8) * 255
+
+
+# ───────────────────────── Sapiens segmenter ─────────────────────────
+
+SAPIENS_HAIR_CLASS = 3
+SAPIENS_INPUT_H, SAPIENS_INPUT_W = 1024, 768
+SAPIENS_MEAN = np.array([123.5, 116.5, 103.5], dtype=np.float32)
+SAPIENS_STD = np.array([58.5, 57.0, 57.5], dtype=np.float32)
+
+SAPIENS_CHECKPOINTS = {
+    "0.3b": ("facebook/sapiens-seg-0.3b-torchscript",
+             "sapiens_0.3b_goliath_best_goliath_mIoU_7673_epoch_194_torchscript.pt2"),
+    "0.6b": ("facebook/sapiens-seg-0.6b-torchscript",
+             "sapiens_0.6b_goliath_best_goliath_mIoU_7777_epoch_178_torchscript.pt2"),
+    "1b":   ("facebook/sapiens-seg-1b-torchscript",
+             "sapiens_1b_goliath_best_goliath_mIoU_7994_epoch_151_torchscript.pt2"),
+    "2b":   ("facebook/sapiens-seg-2b-torchscript",
+             "sapiens_2b_goliath_best_goliath_mIoU_8129_epoch_200_torchscript.pt2"),
+}
+
+
+def _letterbox(image: Image.Image, target_h: int, target_w: int):
+    src_w, src_h = image.size
+    scale = min(target_h / src_h, target_w / src_w)
+    new_h, new_w = int(round(src_h * scale)), int(round(src_w * scale))
+    resized = image.resize((new_w, new_h), Image.BICUBIC)
+    canvas = Image.new("RGB", (target_w, target_h), (0, 0, 0))
+    top, left = (target_h - new_h) // 2, (target_w - new_w) // 2
+    canvas.paste(resized, (left, top))
+    return canvas, (top, left, new_h, new_w)
+
+
+class SapiensSegmenter:
+    def __init__(self, size: str = "2b", device: str | None = None):
+        from huggingface_hub import hf_hub_download
+
+        if size not in SAPIENS_CHECKPOINTS:
+            raise ValueError(f"unknown sapiens size {size!r}")
+        self.size = size
+        self.device = pick_device(device)
+        self.name = f"sapiens-{size}"
+        repo_id, filename = SAPIENS_CHECKPOINTS[size]
+        log.info(f"loading {self.name} from {repo_id}/{filename} on {self.device}")
+        path = hf_hub_download(repo_id=repo_id, filename=filename)
+        self.model = torch.jit.load(path, map_location=self.device).eval()
+
+    @torch.inference_mode()
+    def segment(self, image: Image.Image) -> np.ndarray:
+        # Match the official Sapiens preprocessing exactly: direct resize to
+        # (W, H) with bilinear interpolation, RGB order, normalize with mean/std.
+        # No letterbox — Sapiens was trained on aspect-ratio-distorted inputs.
+        resized = image.resize((SAPIENS_INPUT_W, SAPIENS_INPUT_H), Image.BILINEAR)
+        arr = np.asarray(resized, dtype=np.float32)
+        arr = (arr - SAPIENS_MEAN) / SAPIENS_STD
+        tensor = torch.from_numpy(arr).permute(2, 0, 1).unsqueeze(0).to(self.device)
+        logits = self.model(tensor)
+        # Upsample logits to original image size before argmax — preserves
+        # boundary detail better than nearest-resizing the discrete label map.
+        logits = torch.nn.functional.interpolate(
+            logits, size=(image.height, image.width),
+            mode="bilinear", align_corners=False,
+        )
+        labels = logits.argmax(dim=1)[0].cpu().numpy()
+        return ((labels == SAPIENS_HAIR_CLASS).astype(np.uint8) * 255)
+
+
+# ───────────────────────── SegFormer fallback segmenter ─────────────────────────
+
+class SegFormerSegmenter:
+    """Lighter face-parsing fallback (`jonathandinu/face-parsing`, SegFormer-B5)."""
+
+    def __init__(self, device: str | None = None):
+        from transformers import SegformerForSemanticSegmentation, SegformerImageProcessor
+
+        self.device = pick_device(device)
+        self.name = "segformer-b5-faceparsing"
+        log.info(f"loading {self.name} on {self.device}")
+        self.processor = SegformerImageProcessor.from_pretrained("jonathandinu/face-parsing")
+        self.model = (SegformerForSemanticSegmentation
+                      .from_pretrained("jonathandinu/face-parsing")
+                      .to(self.device).eval())
+        id2label = self.model.config.id2label
+        self.hair_id = next((int(i) for i, n in id2label.items() if str(n).lower() == "hair"), None)
+        if self.hair_id is None:
+            raise RuntimeError(f"no hair label in {id2label}")
+
+    @torch.inference_mode()
+    def segment(self, image: Image.Image) -> np.ndarray:
+        inputs = self.processor(images=image, return_tensors="pt").to(self.device)
+        logits = self.model(**inputs).logits
+        upsampled = torch.nn.functional.interpolate(
+            logits, size=(image.height, image.width), mode="bilinear", align_corners=False)
+        labels = upsampled.argmax(dim=1)[0].cpu().numpy()
+        return (labels == self.hair_id).astype(np.uint8) * 255
+
+
+# ───────────────────────── MatAnyone matter ─────────────────────────
+
+class MatAnyoneMatter:
+    def __init__(self):
+        from matanyone import InferenceCore  # noqa: F401  (early import-check)
+        self.name = "matanyone"
+        self._core_cls = InferenceCore
+        self._core = None
+
+    def _get_core(self):
+        if self._core is None:
+            log.info("instantiating MatAnyone (PeiqingYang/MatAnyone)")
+            self._core = self._core_cls("PeiqingYang/MatAnyone")
+        return self._core
+
+    def matte(self, image: Image.Image, mask: np.ndarray) -> np.ndarray:
+        # MatAnyone's process_video expects a *directory* of frames (or an
+        # mp4), not a single image. Wrap the single image as a one-frame
+        # "video" in a temp dir, ask for per-frame PNG output, and pick up
+        # the alpha matte at out/frames/pha/00000.png.
+        work = Path(tempfile.mkdtemp(prefix="matanyone_"))
+        try:
+            frames_dir = work / "frames"
+            frames_dir.mkdir()
+            mask_path = work / "mask.png"
+            out_dir = work / "out"
+            out_dir.mkdir()
+            image.save(frames_dir / "0001.jpg")
+            Image.fromarray(mask, mode="L").save(mask_path)
+
+            core = self._get_core()
+            core.process_video(
+                input_path=str(frames_dir),
+                mask_path=str(mask_path),
+                output_path=str(out_dir),
+                n_warmup=10,
+                save_image=True,
+            )
+            alpha_pngs = sorted((out_dir / "frames" / "pha").glob("*.png"))
+            if not alpha_pngs:
+                raise RuntimeError(
+                    f"MatAnyone produced no alpha PNGs under {out_dir}/frames/pha"
+                )
+            alpha_pil = Image.open(alpha_pngs[0]).convert("L")
+            if alpha_pil.size != image.size:
+                alpha_pil = alpha_pil.resize(image.size, Image.BILINEAR)
+            return np.asarray(alpha_pil, dtype=np.float32) / 255.0
+        finally:
+            shutil.rmtree(work, ignore_errors=True)
+
+
+# ───────────────────────── Feather fallback matter ─────────────────────────
+
+class FeatherMatter:
+    """Pure-PIL feather of the binary mask. No matting, but always available."""
+
+    def __init__(self, radius: float = 4.0):
+        self.name = f"feather-r{radius}"
+        self.radius = radius
+
+    def matte(self, image: Image.Image, mask: np.ndarray) -> np.ndarray:
+        pil = Image.fromarray(mask, mode="L")
+        if self.radius > 0:
+            pil = pil.filter(ImageFilter.GaussianBlur(radius=self.radius))
+        return np.asarray(pil, dtype=np.float32) / 255.0
+
+
+# ───────────────────────── builders with fallback ─────────────────────────
+
+def build_segmenter(prefer: str = "sam3", sapiens_size: str = "2b",
+                    device: str | None = None,
+                    sam3_version: str = "sam3.1") -> Segmenter:
+    """Try the requested model first; cascade through fallbacks on failure.
+
+    Default cascade order: sapiens → segformer (both fully open, no HF approval).
+    Picking 'sam3' adds it on top: sam3 → sapiens → segformer.
+    """
+    chain = []
+    if prefer == "sam3":
+        chain = ["sam3", "sapiens", "segformer"]
+    elif prefer == "sapiens":
+        chain = ["sapiens", "segformer"]
+    elif prefer == "segformer":
+        chain = ["segformer"]
+    else:
+        raise ValueError(f"unknown segmenter {prefer!r}")
+
+    last_err: Exception | None = None
+    for choice in chain:
+        try:
+            if choice == "sam3":
+                return Sam3Segmenter(device=device, version=sam3_version)
+            if choice == "sapiens":
+                return SapiensSegmenter(size=sapiens_size, device=device)
+            if choice == "segformer":
+                return SegFormerSegmenter(device=device)
+        except Exception as e:
+            log.warning(f"{choice} unavailable ({e}); trying next fallback")
+            last_err = e
+    raise RuntimeError(f"all segmenters failed; last error: {last_err}")
+
+
+def build_matter(prefer: str = "matanyone", feather_radius: float = 4.0) -> Matter:
+    if prefer == "matanyone":
+        try:
+            return MatAnyoneMatter()
+        except Exception as e:
+            log.warning(f"MatAnyone unavailable ({e}); falling back to feather")
+    return FeatherMatter(radius=feather_radius)
+
+
+# ───────────────────────── compositing ─────────────────────────
+
+def composite_blur(image: Image.Image, alpha: np.ndarray, blur_radius: float) -> Image.Image:
+    blurred = image.filter(ImageFilter.GaussianBlur(radius=blur_radius))
+    src = np.asarray(image, dtype=np.float32)
+    blr = np.asarray(blurred, dtype=np.float32)
+    a = alpha[..., None]
+    out = a * blr + (1.0 - a) * src
+    return Image.fromarray(np.clip(out, 0, 255).astype(np.uint8))
+
+
+def clean_mask(mask: np.ndarray, min_area_ratio: float = 0.0005) -> np.ndarray:
+    """Drop isolated specks and fill tiny holes (cv2-based, optional)."""
+    try:
+        import cv2
+    except ImportError:
+        return mask
+    binary = (mask > 127).astype(np.uint8)
+    n, labels, stats, _ = cv2.connectedComponentsWithStats(binary, connectivity=8)
+    min_area = max(1, int(binary.size * min_area_ratio))
+    keep = np.zeros_like(binary)
+    for i in range(1, n):
+        if stats[i, cv2.CC_STAT_AREA] >= min_area:
+            keep[labels == i] = 1
+    kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (5, 5))
+    closed = cv2.morphologyEx(keep, cv2.MORPH_CLOSE, kernel)
+    return (closed * 255).astype(np.uint8)
+
+
+# ───────────────────────── pipeline ─────────────────────────
+
+@dataclass
+class BlurResult:
+    output: Image.Image
+    mask: Image.Image          # binary semantic mask (uint8 L)
+    alpha: Image.Image         # soft alpha matte (uint8 L)
+    segmenter: str             # which segmenter actually ran
+    matter: str                # which matter actually ran
+    coverage: float            # fraction of image flagged as hair (0..1)
+
+
+class HairBlurPipeline:
+    def __init__(self,
+                 segmenter: Segmenter | None = None,
+                 matter: Matter | None = None,
+                 sapiens_size: str = "2b",
+                 prefer_segmenter: str = "sam3",
+                 prefer_matter: str = "matanyone",
+                 device: str | None = None,
+                 feather_radius: float = 4.0,
+                 sam3_version: str = "sam3.1"):
+        self.segmenter = segmenter or build_segmenter(
+            prefer_segmenter, sapiens_size, device, sam3_version=sam3_version
+        )
+        self.matter = matter or build_matter(prefer_matter, feather_radius)
+
+    def __call__(self, image: Image.Image, blur_radius: float = 25.0,
+                 do_clean: bool = True) -> BlurResult:
+        if image.mode != "RGB":
+            image = image.convert("RGB")
+
+        mask = self.segmenter.segment(image)
+        if do_clean:
+            mask = clean_mask(mask)
+        coverage = float((mask > 127).mean())
+        if coverage < 1e-4:
+            log.warning(f"hair coverage {coverage:.4%}; mask may be empty")
+
+        alpha = self.matter.matte(image, mask)
+        out = composite_blur(image, alpha, blur_radius=blur_radius)
+        return BlurResult(
+            output=out,
+            mask=Image.fromarray(mask, mode="L"),
+            alpha=Image.fromarray((alpha * 255).clip(0, 255).astype(np.uint8), mode="L"),
+            segmenter=self.segmenter.name,
+            matter=self.matter.name,
+            coverage=coverage,
+        )

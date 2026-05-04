@@ -1,0 +1,207 @@
+diff --git a/sam3/model/decoder.py b/sam3/model/decoder.py
+index b90e55f..0083171 100644
+--- a/sam3/model/decoder.py
++++ b/sam3/model/decoder.py
+@@ -279,8 +279,11 @@ class TransformerDecoder(nn.Module):
+ 
+             if resolution is not None and stride is not None:
+                 feat_size = resolution // stride
++                # Stay on CPU — model migration handles device placement
++                # later. MPS pick caused cross-device crashes when model
++                # ran on CPU.
+                 coords_h, coords_w = self._get_coords(
+-                    feat_size, feat_size, device="cuda"
++                    feat_size, feat_size, device="cpu"
+                 )
+                 self.compilable_cord_cache = (coords_h, coords_w)
+                 self.compilable_stored_size = (feat_size, feat_size)
+diff --git a/sam3/model/edt.py b/sam3/model/edt.py
+index 498f28f..fa2090b 100644
+--- a/sam3/model/edt.py
++++ b/sam3/model/edt.py
+@@ -5,8 +5,16 @@
+ """Triton kernel for euclidean distance transform (EDT)"""
+ 
+ import torch
+-import triton
+-import triton.language as tl
++
++# Triton is CUDA-only and has no macOS wheels; fall back gracefully.
++try:
++    import triton
++    import triton.language as tl
++    HAS_TRITON = True
++except (ImportError, ModuleNotFoundError):
++    HAS_TRITON = False
++    triton = None
++    tl = None
+ 
+ """
+ Disclaimer: This implementation is not meant to be extremely efficient. A CUDA kernel would likely be more efficient.
+@@ -52,8 +60,9 @@ Overall, despite being quite naive, this implementation is roughly 5.5x faster t
+ """
+ 
+ 
+-@triton.jit
+-def edt_kernel(inputs_ptr, outputs_ptr, v, z, height, width, horizontal: tl.constexpr):
++if HAS_TRITON:
++  @triton.jit
++  def edt_kernel(inputs_ptr, outputs_ptr, v, z, height, width, horizontal: tl.constexpr):
+     # This is a somewhat verbatim implementation of the efficient 1D EDT algorithm described above
+     # It can be applied horizontally or vertically depending if we're doing the first or second stage.
+     # It's parallelized across batch+row (or batch+col if horizontal=False)
+@@ -116,6 +125,21 @@ def edt_kernel(inputs_ptr, outputs_ptr, v, z, height, width, horizontal: tl.cons
+         tl.store(outputs_ptr + block_start + (q * stride), old_value + d * d)
+ 
+ 
++def edt_cpu_fallback(data: torch.Tensor) -> torch.Tensor:
++    """SciPy-based CPU/MPS fallback when triton is unavailable (e.g. macOS)."""
++    from scipy.ndimage import distance_transform_edt
++    assert data.dim() == 3
++    B, _, _ = data.shape
++    device, dtype = data.device, torch.float32
++    cpu_data = data.detach().cpu().numpy()
++    out = torch.empty(data.shape, dtype=dtype)
++    for i in range(B):
++        # Triton EDT measures distance to the nearest "0" pixel of the input;
++        # match that semantics: invert before scipy's transform.
++        out[i] = torch.from_numpy(distance_transform_edt(1 - cpu_data[i]).astype("float32"))
++    return out.to(device)
++
++
+ def edt_triton(data: torch.Tensor):
+     """
+     Computes the Euclidean Distance Transform (EDT) of a batch of binary images.
+@@ -128,7 +152,8 @@ def edt_triton(data: torch.Tensor):
+         It should be equivalent to a batched version of cv2.distanceTransform(input, cv2.DIST_L2, 0)
+     """
+     assert data.dim() == 3
+-    assert data.is_cuda
++    if not HAS_TRITON or not data.is_cuda:
++        return edt_cpu_fallback(data)
+     B, H, W = data.shape
+     data = data.contiguous()
+ 
+diff --git a/sam3/model/geometry_encoders.py b/sam3/model/geometry_encoders.py
+index d60ee54..fda4a78 100644
+--- a/sam3/model/geometry_encoders.py
++++ b/sam3/model/geometry_encoders.py
+@@ -644,8 +644,9 @@ class SequenceGeometryEncoder(nn.Module):
+             # boxes are [Num_boxes, bs, 4], normalized in [0, 1]
+             # We need to denormalize, and convert to [x, y, x, y]
+             boxes_xyxy = box_cxcywh_to_xyxy(boxes)
+-            scale = torch.tensor([W, H, W, H], dtype=boxes_xyxy.dtype)
+-            scale = scale.pin_memory().to(device=boxes_xyxy.device, non_blocking=True)
++            scale = torch.tensor(
++                [W, H, W, H], dtype=boxes_xyxy.dtype, device=boxes_xyxy.device
++            )
+             scale = scale.view(1, 1, 4)
+             boxes_xyxy = boxes_xyxy * scale
+             sampled = torchvision.ops.roi_align(
+diff --git a/sam3/model/position_encoding.py b/sam3/model/position_encoding.py
+index f38c62b..85de7c1 100644
+--- a/sam3/model/position_encoding.py
++++ b/sam3/model/position_encoding.py
+@@ -51,8 +51,11 @@ class PositionEmbeddingSine(nn.Module):
+                 (int(precompute_resolution // 28), int(precompute_resolution // 28)),
+                 (precompute_resolution // 32, precompute_resolution // 32),
+             ]
++            # Precompute on CPU only — tensors are small and the model
++            # itself migrates them to its device later. Hardcoded "cuda"
++            # crashed on Mac, "mps" caused mismatches when model is on CPU.
+             for size in precompute_sizes:
+-                tensors = torch.zeros((1, 1) + size, device="cuda")
++                tensors = torch.zeros((1, 1) + size, device="cpu")
+                 self.forward(tensors)
+                 # further clone and detach it in the cache (just to be safe)
+                 self.cache[size] = self.cache[size].clone().detach()
+diff --git a/sam3/model/sam3_image_processor.py b/sam3/model/sam3_image_processor.py
+index 83bbb0d..4ca570c 100644
+--- a/sam3/model/sam3_image_processor.py
++++ b/sam3/model/sam3_image_processor.py
+@@ -14,9 +14,13 @@ from torchvision.transforms import v2
+ class Sam3Processor:
+     """ """
+ 
+-    def __init__(self, model, resolution=1008, device="cuda", confidence_threshold=0.5):
++    def __init__(self, model, resolution=1008, device=None, confidence_threshold=0.5):
+         self.model = model
+         self.resolution = resolution
++        if device is None:
++            device = "cuda" if torch.cuda.is_available() else (
++                "mps" if torch.backends.mps.is_available() else "cpu"
++            )
+         self.device = device
+         self.transform = v2.Compose(
+             [
+diff --git a/sam3/model/vl_combiner.py b/sam3/model/vl_combiner.py
+index b2cf102..e9935aa 100644
+--- a/sam3/model/vl_combiner.py
++++ b/sam3/model/vl_combiner.py
+@@ -121,7 +121,7 @@ class SAM3VLBackbone(nn.Module):
+         return output
+ 
+     def forward_text(
+-        self, captions, input_boxes=None, additional_text=None, device="cuda"
++        self, captions, input_boxes=None, additional_text=None, device=None
+     ):
+         return activation_ckpt_wrapper(self._forward_text_no_ack_ckpt)(
+             captions=captions,
+@@ -136,7 +136,7 @@ class SAM3VLBackbone(nn.Module):
+         captions,
+         input_boxes=None,
+         additional_text=None,
+-        device="cuda",
++        device=None,
+     ):
+         output = {}
+ 
+@@ -324,7 +324,7 @@ class VisionOnly(nn.Module):
+         captions,
+         input_boxes=None,
+         additional_text=None,
+-        device="cuda",
++        device=None,
+     ):
+         bs = len(captions)
+         output = {
+diff --git a/sam3/perflib/fused.py b/sam3/perflib/fused.py
+index 6800cca..e70cebd 100644
+--- a/sam3/perflib/fused.py
++++ b/sam3/perflib/fused.py
+@@ -12,14 +12,26 @@ def addmm_act(activation, linear, mat1):
+         raise ValueError("Expected grad to be disabled.")
+     self = linear.bias.detach()
+     mat2 = linear.weight.detach()
+-    self = self.to(torch.bfloat16)
+-    mat1 = mat1.to(torch.bfloat16)
+-    mat2 = mat2.to(torch.bfloat16)
++    # BF16 path is for CUDA where _addmm_activation has a BF16 kernel; on
++    # CPU/MPS keep everything float32 so subsequent layers don't see dtype
++    # mismatches.
++    use_bf16 = mat1.is_cuda and mat2.is_cuda and self.is_cuda
++    work_dtype = torch.bfloat16 if use_bf16 else torch.float32
++    in_dtype = mat1.dtype
++    self = self.to(work_dtype)
++    mat1 = mat1.to(work_dtype)
++    mat2 = mat2.to(work_dtype)
+     mat1_flat = mat1.view(-1, mat1.shape[-1])
+     if activation in [torch.nn.functional.relu, torch.nn.ReLU]:
+-        y = addmm_act_op(self, mat1_flat, mat2.t(), beta=1, alpha=1, use_gelu=False)
+-        return y.view(mat1.shape[:-1] + (y.shape[-1],))
+-    if activation in [torch.nn.functional.gelu, torch.nn.GELU]:
+-        y = addmm_act_op(self, mat1_flat, mat2.t(), beta=1, alpha=1, use_gelu=True)
+-        return y.view(mat1.shape[:-1] + (y.shape[-1],))
+-    raise ValueError(f"Unexpected activation {activation}")
++        use_gelu = False
++    elif activation in [torch.nn.functional.gelu, torch.nn.GELU]:
++        use_gelu = True
++    else:
++        raise ValueError(f"Unexpected activation {activation}")
++    try:
++        y = addmm_act_op(self, mat1_flat, mat2.t(), beta=1, alpha=1, use_gelu=use_gelu)
++    except (RuntimeError, NotImplementedError):
++        # Fallback: plain matmul + bias + activation (slower but portable).
++        y = torch.addmm(self, mat1_flat, mat2.t())
++        y = torch.nn.functional.gelu(y) if use_gelu else torch.nn.functional.relu(y)
++    return y.view(mat1.shape[:-1] + (y.shape[-1],)).to(in_dtype)
