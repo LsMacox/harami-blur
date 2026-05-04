@@ -14,9 +14,12 @@ detected women, leave face / clothing / background untouched.
 
 from __future__ import annotations
 
+import hashlib
 import logging
 import shutil
 import tempfile
+import threading
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Protocol
@@ -31,6 +34,19 @@ if not log.handlers:
     h = logging.StreamHandler()
     h.setFormatter(logging.Formatter("[%(levelname)s] %(name)s: %(message)s"))
     log.addHandler(h)
+
+
+# ───────────────────────── helpers ─────────────────────────
+
+def image_content_hash(image: Image.Image) -> str:
+    """Fast content hash of a PIL image. ~5–10 ms for a 2 MP image.
+
+    Used as a key for the SAM 3 image-state cache and the pipeline-level
+    mask cache so re-running the same image (e.g. tweaking blur radius
+    in the UI) skips the expensive ViT pass.
+    """
+    arr = np.asarray(image)
+    return hashlib.blake2b(arr.tobytes(), digest_size=16).hexdigest()
 
 
 # ───────────────────────── device helper ─────────────────────────
@@ -81,7 +97,8 @@ class Sam3Segmenter:
                  device: str | None = None,
                  version: str = "sam3.1",
                  text_prompt: str | list[str] | dict | None = None,
-                 checkpoint_path: str | None = None):
+                 checkpoint_path: str | None = None,
+                 state_cache_size: int = 4):
         try:
             from sam3.model_builder import (
                 build_sam3_image_model,
@@ -152,6 +169,37 @@ class Sam3Segmenter:
         # auto-detect can pick MPS even when model is on CPU.
         self.processor = Sam3Processor(model, device=self.device)
 
+        # Cache encoded image state by content hash. The heavy ViT pass
+        # behind set_image is the dominant cost on CPU (~25s on Apple
+        # Silicon for a 1000×667 photo); reusing it across repeated calls
+        # makes UI tweaks (blur radius, matter type) effectively free.
+        self._state_cache: dict[str, dict] = {}
+        self._state_cache_lock = threading.Lock()
+        self._state_cache_max = state_cache_size
+
+    def get_image_state(self, image: Image.Image):
+        """Return SAM 3 image state, encoding once and caching by hash.
+
+        On a cache hit we still call `reset_all_prompts` so the returned
+        state has no leftover text/box prompts from previous queries.
+        """
+        h = image_content_hash(image)
+        with self._state_cache_lock:
+            cached = self._state_cache.get(h)
+            if cached is not None:
+                self.processor.reset_all_prompts(cached)
+                log.info(f"sam3 state cache hit ({h[:8]})")
+                return cached
+        # Heavy path — compute encoding outside the lock so we don't block
+        # other threads asking for unrelated images.
+        log.info(f"sam3 encoding image ({h[:8]})…")
+        state = self.processor.set_image(image)
+        with self._state_cache_lock:
+            if len(self._state_cache) >= self._state_cache_max:
+                self._state_cache.pop(next(iter(self._state_cache)))
+            self._state_cache[h] = state
+        return state
+
     @staticmethod
     def _output_to_union(output, h: int, w: int) -> np.ndarray:
         """Collapse SAM 3 output['masks'] into a bool union mask."""
@@ -186,9 +234,8 @@ class Sam3Segmenter:
 
     @torch.inference_mode()
     def segment(self, image: Image.Image) -> np.ndarray:
-        # Encode the image once; state["backbone_out"] holds the heavy ViT
-        # features. All subsequent prompts are cheap text-only passes.
-        state = self.processor.set_image(image)
+        # Cached encoding — single heavy ViT pass per unique image.
+        state = self.get_image_state(image)
 
         target_union = np.zeros((image.height, image.width), dtype=bool)
         for prompt in self.targets:
@@ -217,7 +264,7 @@ class Sam3Segmenter:
     def detect(self, image: Image.Image, prompt: str) -> float:
         """Return fraction of image covered by `prompt` — for soft checks
         like 'is there a woman in this photo'."""
-        state = self.processor.set_image(image)
+        state = self.get_image_state(image)
         return float(self._run_prompt_on_state(
             state, prompt, image.height, image.width
         ).mean())
@@ -320,25 +367,49 @@ class SapiensSegmenter:
         path = hf_hub_download(repo_id=repo_id, filename=filename)
         self.model = torch.jit.load(path, map_location=self.device).eval()
 
-    @torch.inference_mode()
-    def segment(self, image: Image.Image) -> np.ndarray:
-        # Match the official Sapiens preprocessing exactly: direct resize to
-        # (W, H) with bilinear interpolation, RGB order, normalize with mean/std.
-        # No letterbox — Sapiens was trained on aspect-ratio-distorted inputs.
+    def _preprocess(self, image: Image.Image) -> torch.Tensor:
+        """Sapiens-style: direct resize to (W, H) bilinear, RGB, normalize.
+        Returns CHW float32 tensor (no batch dim)."""
         resized = image.resize((SAPIENS_INPUT_W, SAPIENS_INPUT_H), Image.BILINEAR)
         arr = np.asarray(resized, dtype=np.float32)
         arr = (arr - SAPIENS_MEAN) / SAPIENS_STD
-        tensor = torch.from_numpy(arr).permute(2, 0, 1).unsqueeze(0).to(self.device)
-        logits = self.model(tensor)
-        # Upsample logits to original image size before argmax — preserves
-        # boundary detail better than nearest-resizing the discrete label map.
-        logits = torch.nn.functional.interpolate(
-            logits, size=(image.height, image.width),
+        return torch.from_numpy(arr).permute(2, 0, 1)
+
+    def _logits_to_mask(self, logits_1chw: torch.Tensor,
+                        target_h: int, target_w: int) -> np.ndarray:
+        """Upsample logits to original image size, argmax, return uint8 mask."""
+        logits_1chw = torch.nn.functional.interpolate(
+            logits_1chw, size=(target_h, target_w),
             mode="bilinear", align_corners=False,
         )
-        labels = logits.argmax(dim=1)[0].cpu().numpy()
+        labels = logits_1chw.argmax(dim=1)[0].cpu().numpy()
         mask = np.isin(labels, self.target_class_indices)
-        return (mask.astype(np.uint8) * 255)
+        return mask.astype(np.uint8) * 255
+
+    @torch.inference_mode()
+    def segment(self, image: Image.Image) -> np.ndarray:
+        tensor = self._preprocess(image).unsqueeze(0).to(self.device)
+        logits = self.model(tensor)
+        return self._logits_to_mask(logits, image.height, image.width)
+
+    @torch.inference_mode()
+    def segment_batch(self, images: list[Image.Image]) -> list[np.ndarray]:
+        """Batch version — N images in one forward pass.
+
+        All inputs are resized to (1024, 768) regardless of aspect ratio
+        (Sapiens was trained that way). Output masks are returned at each
+        image's original resolution.
+        """
+        if not images:
+            return []
+        batch = torch.stack([self._preprocess(img) for img in images]).to(self.device)
+        logits = self.model(batch)  # (B, C, H/2, W/2)
+        results = []
+        for i, img in enumerate(images):
+            results.append(self._logits_to_mask(
+                logits[i:i + 1], img.height, img.width
+            ))
+        return results
 
 
 # ───────────────────────── SegFormer fallback segmenter ─────────────────────────
@@ -454,7 +525,12 @@ class HybridSegmenter:
                  device: str | None = None,
                  sam3_version: str = "sam3.1",
                  restrict_to: str = SAM3_MODESTY_RESTRICT_TO,
-                 sam3_targets: list[str] | None = None):
+                 sam3_targets: list[str] | None = None,
+                 smart_crop: bool = True,
+                 small_instance_threshold: float = 0.15,
+                 crop_padding: float = 0.15,
+                 min_crop_side: int = 64,
+                 max_crops_per_batch: int = 16):
         self.body = SapiensSegmenter(
             size=sapiens_size,
             device=device,
@@ -473,35 +549,132 @@ class HybridSegmenter:
             text_prompt={"targets": sam3_targets, "restrict_to": None},
         )
         self.restrict_to = restrict_to
+        self.smart_crop = smart_crop
+        self.small_instance_threshold = small_instance_threshold
+        self.crop_padding = crop_padding
+        self.min_crop_side = min_crop_side
+        self.max_crops_per_batch = max_crops_per_batch
         self.name = (
             f"hybrid:{self.body.name}"
             f"+{self.sam3.version}:{'+'.join(sam3_targets)}"
             f"@{restrict_to}"
+            + ("+smartcrop" if smart_crop else "")
         )
 
-    def segment(self, image: Image.Image) -> np.ndarray:
-        body_mask = self.body.segment(image)
+    def _run_sam3(self, image: Image.Image
+                  ) -> tuple[np.ndarray, np.ndarray, list[tuple[int, int, int, int]]]:
+        """Single SAM 3 image-encode (cached) + all target prompts + gender.
 
-        # Single heavy ViT pass; everything below is cheap text-only forward.
-        state = self.sam3.processor.set_image(image)
+        Returns:
+            sam3_union: bool mask, union of target prompt masks
+            gender:     bool mask, silhouette of `restrict_to` prompt
+            instances:  list of per-instance (x1, y1, x2, y2) bboxes for
+                        `restrict_to` — used by smart-crop pass
+        """
+        state = self.sam3.get_image_state(image)
+        h, w = image.height, image.width
 
-        sam3_union = np.zeros((image.height, image.width), dtype=bool)
+        sam3_union = np.zeros((h, w), dtype=bool)
         for prompt in self.sam3_targets:
             log.info(f"hybrid sam3 target: {prompt!r}")
-            sam3_union |= self.sam3._run_prompt_on_state(
-                state, prompt, image.height, image.width
+            sam3_union |= self.sam3._run_prompt_on_state(state, prompt, h, w)
+
+        # `restrict_to` pass — get gender mask AND per-instance bboxes
+        # (last prompt run, so output stays in state for box extraction).
+        self.sam3.processor.reset_all_prompts(state)
+        output = self.sam3.processor.set_text_prompt(
+            state=state, prompt=self.restrict_to
+        )
+        gender = self.sam3._output_to_union(output, h, w)
+
+        instances: list[tuple[int, int, int, int]] = []
+        boxes_t = output.get("boxes") if isinstance(output, dict) else None
+        if isinstance(boxes_t, torch.Tensor) and boxes_t.numel() > 0:
+            arr = boxes_t.detach().cpu().numpy()
+            while arr.ndim > 2:
+                arr = arr[0]
+            for box in arr:
+                x1, y1, x2, y2 = (int(round(v)) for v in box[:4].tolist())
+                instances.append((
+                    max(0, min(w, x1)),
+                    max(0, min(h, y1)),
+                    max(0, min(w, x2)),
+                    max(0, min(h, y2)),
+                ))
+        return sam3_union, gender, instances
+
+    def _smart_crop_pass(self, image: Image.Image,
+                         instances: list[tuple[int, int, int, int]]
+                         ) -> np.ndarray:
+        """For small woman instances, run a Sapiens pass on the crop.
+        On a tight portrait of one person Sapiens already sees the body
+        well, so we only crop instances smaller than `small_instance_threshold`
+        of the image area. All crops go through Sapiens in a single batched
+        forward — N crops cost roughly the same as 1, not N×."""
+        H, W = image.height, image.width
+        total_area = H * W
+        crops_to_process: list[tuple[int, int, int, int, Image.Image]] = []
+        for x1, y1, x2, y2 in instances:
+            if x2 <= x1 or y2 <= y1:
+                continue
+            inst_area = (x2 - x1) * (y2 - y1)
+            if inst_area / total_area >= self.small_instance_threshold:
+                continue
+            pw = (x2 - x1) * self.crop_padding
+            ph = (y2 - y1) * self.crop_padding
+            cx1 = max(0, int(x1 - pw))
+            cy1 = max(0, int(y1 - ph))
+            cx2 = min(W, int(x2 + pw))
+            cy2 = min(H, int(y2 + ph))
+            if (cx2 - cx1) < self.min_crop_side or (cy2 - cy1) < self.min_crop_side:
+                continue
+            crops_to_process.append(
+                (cx1, cy1, cx2, cy2, image.crop((cx1, cy1, cx2, cy2)))
             )
 
-        gender = self.sam3._run_prompt_on_state(
-            state, self.restrict_to, image.height, image.width
-        )
+        result = np.zeros((H, W), dtype=np.uint8)
+        if not crops_to_process:
+            return result
+        log.info(f"smart-crop: {len(crops_to_process)} small instances")
+
+        # Batch through Sapiens in chunks (avoid OOM on huge groups).
+        for i in range(0, len(crops_to_process), self.max_crops_per_batch):
+            chunk = crops_to_process[i:i + self.max_crops_per_batch]
+            crop_imgs = [c[4] for c in chunk]
+            crop_masks = self.body.segment_batch(crop_imgs)
+            for (cx1, cy1, cx2, cy2, _img), cmask in zip(chunk, crop_masks):
+                result[cy1:cy2, cx1:cx2] = np.maximum(
+                    result[cy1:cy2, cx1:cx2], cmask
+                )
+        return result
+
+    def segment(self, image: Image.Image) -> np.ndarray:
+        H, W = image.height, image.width
+        # Sapiens lives on MPS (or CUDA), SAM 3 lives on CPU — different
+        # devices, so PyTorch can run them concurrently. Both ops release
+        # the GIL during native inference.
+        with ThreadPoolExecutor(max_workers=2) as ex:
+            body_fut = ex.submit(self.body.segment, image)
+            sam3_fut = ex.submit(self._run_sam3, image)
+            body_full = body_fut.result()
+            sam3_union, gender, instances = sam3_fut.result()
+
         if gender.mean() < 1e-4:
             log.warning(
                 f"hybrid: '{self.restrict_to}' silhouette empty; returning empty mask"
             )
-            return np.zeros((image.height, image.width), dtype=np.uint8)
+            return np.zeros((H, W), dtype=np.uint8)
 
-        target = (body_mask > 127) | sam3_union
+        # Per-instance Sapiens crops fill in body-part detail on small bodies
+        # in crowded photos (where a single 1024×768 Sapiens pass downsamples
+        # each person too aggressively to detect arms / legs reliably).
+        body_per_instance = (
+            self._smart_crop_pass(image, instances)
+            if self.smart_crop and instances
+            else np.zeros((H, W), dtype=np.uint8)
+        )
+
+        target = (body_full > 127) | (body_per_instance > 127) | sam3_union
         return ((target & gender).astype(np.uint8) * 255)
 
 
@@ -614,12 +787,20 @@ class HairBlurPipeline:
                  prefer_matter: str = "matanyone",
                  device: str | None = None,
                  feather_radius: float = 4.0,
-                 sam3_version: str = "sam3.1"):
+                 sam3_version: str = "sam3.1",
+                 mask_cache_size: int = 4):
         self.segmenter = segmenter or build_segmenter(
             prefer_segmenter, sapiens_size, device,
             sam3_version=sam3_version,
         )
         self.matter = matter or build_matter(prefer_matter, feather_radius)
+        # Cache the final (mask, alpha) per image hash. The slow stages —
+        # segmentation and matting — only depend on the image and the
+        # `do_clean` flag, never on blur_radius. So tweaking blur radius
+        # in the UI is then just a recomposite (~50 ms).
+        self._mask_cache: dict[tuple, dict] = {}
+        self._mask_cache_lock = threading.Lock()
+        self._mask_cache_max = mask_cache_size
 
     def __call__(self, image: Image.Image, blur_radius: float = 25.0,
                  do_clean: bool = True,
@@ -628,29 +809,51 @@ class HairBlurPipeline:
         if image.mode != "RGB":
             image = image.convert("RGB")
 
-        woman_cov: float | None = None
-        if check_woman:
-            if not isinstance(self.segmenter, Sam3Segmenter):
-                log.warning("woman check requested but only SAM 3 supports it; "
-                            "skipping check")
-            else:
-                woman_cov = self.segmenter.detect(image, "woman")
-                log.info(f"woman coverage: {woman_cov:.2%}")
-                if woman_cov < woman_threshold:
-                    log.warning(
-                        f"no female silhouette detected (woman coverage "
-                        f"{woman_cov:.2%} < {woman_threshold:.2%}); "
-                        f"running blur anyway"
-                    )
+        cache_key = (image_content_hash(image), do_clean, bool(check_woman))
+        with self._mask_cache_lock:
+            cached = self._mask_cache.get(cache_key)
 
-        mask = self.segmenter.segment(image)
-        if do_clean:
-            mask = clean_mask(mask)
-        coverage = float((mask > 127).mean())
-        if coverage < 1e-4:
-            log.warning(f"target coverage {coverage:.4%}; mask may be empty")
+        if cached is not None:
+            log.info(f"pipeline mask cache hit ({cache_key[0][:8]})")
+            mask = cached["mask"]
+            alpha = cached["alpha"]
+            coverage = cached["coverage"]
+            woman_cov = cached["woman_cov"]
+        else:
+            woman_cov = None
+            if check_woman:
+                if not isinstance(self.segmenter, Sam3Segmenter):
+                    log.warning("woman check requested but only SAM 3 supports it; "
+                                "skipping check")
+                else:
+                    woman_cov = self.segmenter.detect(image, "woman")
+                    log.info(f"woman coverage: {woman_cov:.2%}")
+                    if woman_cov < woman_threshold:
+                        log.warning(
+                            f"no female silhouette detected (woman coverage "
+                            f"{woman_cov:.2%} < {woman_threshold:.2%}); "
+                            f"running blur anyway"
+                        )
 
-        alpha = self.matter.matte(image, mask)
+            mask = self.segmenter.segment(image)
+            if do_clean:
+                mask = clean_mask(mask)
+            coverage = float((mask > 127).mean())
+            if coverage < 1e-4:
+                log.warning(f"target coverage {coverage:.4%}; mask may be empty")
+
+            alpha = self.matter.matte(image, mask)
+
+            with self._mask_cache_lock:
+                if len(self._mask_cache) >= self._mask_cache_max:
+                    self._mask_cache.pop(next(iter(self._mask_cache)))
+                self._mask_cache[cache_key] = {
+                    "mask": mask, "alpha": alpha,
+                    "coverage": coverage, "woman_cov": woman_cov,
+                }
+
+        # The composite is cheap; do it on every call so blur_radius takes
+        # effect even on a cache hit.
         out = composite_blur(image, alpha, blur_radius=blur_radius)
         return BlurResult(
             output=out,
