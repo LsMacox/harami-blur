@@ -7,7 +7,7 @@ from pathlib import Path
 
 from PIL import Image
 
-from pipeline import HairBlurPipeline, SAPIENS_CHECKPOINTS
+from pipeline import HairBlurPipeline, SAPIENS_CHECKPOINTS, PIPELINE_MODES
 
 
 def main() -> None:
@@ -34,6 +34,12 @@ def main() -> None:
     p.add_argument("--device", default=None, choices=[None, "cuda", "mps", "cpu"])
     p.add_argument("--no-clean", action="store_true",
                    help="Skip morphological cleanup of the binary mask")
+    p.add_argument("--mode", default="hair", choices=list(PIPELINE_MODES),
+                   help="hair: blur hair only. modesty: blur hair + every "
+                        "exposed-skin body part (face stays clear).")
+    p.add_argument("--check-woman", action="store_true",
+                   help="Run SAM 3 with prompt 'woman' first; warn if no "
+                        "female silhouette is detected. Requires --segmenter sam3.")
     args = p.parse_args()
 
     pipe = HairBlurPipeline(
@@ -43,9 +49,12 @@ def main() -> None:
         device=args.device,
         feather_radius=args.feather_radius,
         sam3_version=args.sam3_version,
+        mode=args.mode,
     )
     image = Image.open(args.input).convert("RGB")
-    result = pipe(image, blur_radius=args.blur_radius, do_clean=not args.no_clean)
+    result = pipe(image, blur_radius=args.blur_radius,
+                  do_clean=not args.no_clean,
+                  check_woman=args.check_woman)
 
     result.output.save(args.output)
     if args.save_mask:
@@ -53,8 +62,10 @@ def main() -> None:
     if args.save_alpha:
         result.alpha.save(args.save_alpha)
 
-    print(f"segmenter={result.segmenter} matter={result.matter} "
-          f"coverage={result.coverage:.2%}")
+    woman = "n/a" if result.woman_check is None else f"{result.woman_check:.2%}"
+    print(f"mode={result.mode} segmenter={result.segmenter} "
+          f"matter={result.matter} coverage={result.coverage:.2%} "
+          f"woman={woman}")
     print(f"saved: {args.output}")
 
 

@@ -22,6 +22,7 @@ from PIL import Image
 
 from pipeline import (
     HairBlurPipeline,
+    PIPELINE_MODES,
     SAPIENS_CHECKPOINTS,
     pick_device,
 )
@@ -37,10 +38,10 @@ _PIPE_KEY: Optional[tuple] = None
 
 def get_pipeline(sapiens_size: str, segmenter: str, matter: str,
                  device: str, feather_radius: float,
-                 sam3_version: str) -> HairBlurPipeline:
+                 sam3_version: str, mode: str) -> HairBlurPipeline:
     global _PIPE, _PIPE_KEY
     key = (sapiens_size, segmenter, matter, device,
-           round(feather_radius, 2), sam3_version)
+           round(feather_radius, 2), sam3_version, mode)
     with _PIPE_LOCK:
         if _PIPE is None or _PIPE_KEY != key:
             _PIPE = HairBlurPipeline(
@@ -50,13 +51,14 @@ def get_pipeline(sapiens_size: str, segmenter: str, matter: str,
                 device=device,
                 feather_radius=feather_radius,
                 sam3_version=sam3_version,
+                mode=mode,
             )
             _PIPE_KEY = key
         return _PIPE
 
 
-def process(image, blur_radius, segmenter, sapiens_size, sam3_version, matter,
-            feather_radius, device_choice, do_clean,
+def process(image, blur_radius, mode, segmenter, sapiens_size, sam3_version,
+            matter, feather_radius, device_choice, do_clean, check_woman,
             progress=gr.Progress(track_tqdm=False)):
     if image is None:
         raise gr.Error("Сначала загрузите изображение.")
@@ -69,22 +71,35 @@ def process(image, blur_radius, segmenter, sapiens_size, sam3_version, matter,
 
     progress(0.05, desc="Загружаю модели…")
     pipe = get_pipeline(sapiens_size, segmenter, matter, device or "",
-                        feather_radius, sam3_version)
+                        feather_radius, sam3_version, mode)
 
+    if check_woman:
+        progress(0.2, desc="Проверяю, что на фото женщина…")
     progress(0.4, desc=f"Сегментация ({pipe.segmenter.name})…")
     progress(0.7, desc=f"Матирование ({pipe.matter.name})…")
-    result = pipe(image, blur_radius=blur_radius, do_clean=do_clean)
+    result = pipe(image, blur_radius=blur_radius, do_clean=do_clean,
+                  check_woman=check_woman)
     progress(1.0, desc="Готово")
 
-    info = (
-        f"**Сегментатор:** `{result.segmenter}`  \n"
-        f"**Матирование:** `{result.matter}`  \n"
-        f"**Покрытие волос:** {result.coverage:.2%}  \n"
-        f"**Размер изображения:** {image.width}×{image.height}"
-    )
+    info_lines = [
+        f"**Режим:** `{result.mode}`",
+        f"**Сегментатор:** `{result.segmenter}`",
+        f"**Матирование:** `{result.matter}`",
+        f"**Покрытие маски:** {result.coverage:.2%}",
+        f"**Размер изображения:** {image.width}×{image.height}",
+    ]
+    if result.woman_check is not None:
+        ok = "✓" if result.woman_check >= 0.01 else "⚠"
+        info_lines.insert(
+            1, f"**Проверка «женщина»:** {ok} покрытие {result.woman_check:.2%}"
+        )
+    info = "  \n".join(info_lines)
     if result.coverage < 0.001:
-        info += "\n\n⚠ Маска практически пустая — модель не нашла волос. " \
-                "Попробуйте сменить сегментатор или загрузить другое изображение."
+        info += "\n\n⚠ Маска практически пустая — модель не нашла целевую " \
+                "область. Смените сегментатор или фото."
+    if result.woman_check is not None and result.woman_check < 0.01:
+        info += "\n\n⚠ На фото не найден женский силуэт (промпт «woman»). " \
+                "Размытие всё равно применено."
     return result.output, result.mask, result.alpha, info
 
 
@@ -148,10 +163,27 @@ def build_ui() -> gr.Blocks:
                 )
 
                 with gr.Accordion("⚙ Настройки", open=True):
+                    mode = gr.Radio(
+                        choices=list(PIPELINE_MODES),
+                        value="hair",
+                        label="Режим",
+                        info="hair — размыть только волосы. "
+                             "modesty — размыть волосы + любые открытые "
+                             "участки кожи (плечи, руки, шея, ноги, торс). "
+                             "Лицо остаётся чётким. Не работает на segformer.",
+                    )
+                    check_woman = gr.Checkbox(
+                        value=False,
+                        label="Сначала проверить, что на фото женщина",
+                        info="Дополнительный прогон SAM 3 с промптом «woman» "
+                             "(+30 сек на CPU). Если силуэт не найден — "
+                             "выводит предупреждение, размытие всё равно "
+                             "применяется. Работает только когда сегментатор = sam3.",
+                    )
                     blur_radius = gr.Slider(
                         1, 100, value=25, step=1,
                         label="Радиус блюра (пиксели)",
-                        info="Сила размытия волос. 5–15 — лёгкое смягчение, "
+                        info="Сила размытия. 5–15 — лёгкое смягчение, "
                              "20–40 — заметный блюр, 60+ — однородное пятно.",
                     )
                     segmenter = gr.Radio(
@@ -242,8 +274,8 @@ def build_ui() -> gr.Blocks:
 
         run_btn.click(
             process,
-            inputs=[inp, blur_radius, segmenter, sapiens_size, sam3_version,
-                    matter, feather_radius, device_choice, do_clean],
+            inputs=[inp, blur_radius, mode, segmenter, sapiens_size, sam3_version,
+                    matter, feather_radius, device_choice, do_clean, check_woman],
             outputs=[out_image, out_mask, out_alpha, info],
         )
 

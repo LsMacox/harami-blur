@@ -76,7 +76,7 @@ class Sam3Segmenter:
     def __init__(self,
                  device: str | None = None,
                  version: str = "sam3.1",
-                 text_prompt: str = "hair",
+                 text_prompt: str | list[str] = "hair",
                  checkpoint_path: str | None = None):
         try:
             from sam3.model_builder import (
@@ -99,8 +99,10 @@ class Sam3Segmenter:
             log.warning("SAM 3 not stable on MPS; running on CPU instead")
             self.device = "cpu"
         self.version = version
-        self.text_prompt = text_prompt
-        self.name = f"{version}:{text_prompt}"
+        if isinstance(text_prompt, str):
+            text_prompt = [text_prompt]
+        self.text_prompts = list(text_prompt)
+        self.name = f"{version}:{'+'.join(self.text_prompts)}"
 
         # Meta's builder only branches on 'cuda'; everything else is CPU.
         build_device = "cuda" if self.device == "cuda" else "cpu"
@@ -130,23 +132,20 @@ class Sam3Segmenter:
         # auto-detect can pick MPS even when model is on CPU.
         self.processor = Sam3Processor(model, device=self.device)
 
-    @torch.inference_mode()
-    def segment(self, image: Image.Image) -> np.ndarray:
+    def _prompt_mask(self, image: Image.Image, prompt: str) -> np.ndarray:
+        """Run SAM 3 once with one text prompt; return bool union mask."""
         state = self.processor.set_image(image)
-        output = self.processor.set_text_prompt(
-            state=state, prompt=self.text_prompt
-        )
+        output = self.processor.set_text_prompt(state=state, prompt=prompt)
         masks = output.get("masks") if isinstance(output, dict) else None
         union = np.zeros((image.height, image.width), dtype=bool)
         if masks is None:
-            return union.astype(np.uint8) * 255
-
+            return union
         if isinstance(masks, torch.Tensor):
             if masks.numel() == 0:
-                return union.astype(np.uint8) * 255
+                return union
             arr = masks.bool().cpu().numpy()
             while arr.ndim > 3:
-                arr = arr[:, 0]      # squeeze [N, 1, H, W] → [N, H, W]
+                arr = arr[:, 0]
             union = arr.any(axis=0)
         else:
             for m in masks:
@@ -154,15 +153,63 @@ class Sam3Segmenter:
                 while a.ndim > 2:
                     a = a[0]
                 union |= a.astype(bool)
+        return union
+
+    @torch.inference_mode()
+    def segment(self, image: Image.Image) -> np.ndarray:
+        union = np.zeros((image.height, image.width), dtype=bool)
+        for prompt in self.text_prompts:
+            log.info(f"sam3 prompt: {prompt!r}")
+            union |= self._prompt_mask(image, prompt)
         return union.astype(np.uint8) * 255
+
+    @torch.inference_mode()
+    def detect(self, image: Image.Image, prompt: str) -> float:
+        """Return fraction of image covered by `prompt` — for soft checks
+        like 'is there a woman in this photo'."""
+        return float(self._prompt_mask(image, prompt).mean())
 
 
 # ───────────────────────── Sapiens segmenter ─────────────────────────
 
-SAPIENS_HAIR_CLASS = 3
 SAPIENS_INPUT_H, SAPIENS_INPUT_W = 1024, 768
 SAPIENS_MEAN = np.array([123.5, 116.5, 103.5], dtype=np.float32)
 SAPIENS_STD = np.array([58.5, 57.0, 57.5], dtype=np.float32)
+
+# Sapiens body-part-seg taxonomy (Goliath, 28 classes).
+SAPIENS_CLASSES = (
+    "Background", "Apparel", "Face_Neck", "Hair",
+    "Left_Foot", "Left_Hand", "Left_Lower_Arm", "Left_Lower_Leg",
+    "Left_Shoe", "Left_Sock", "Left_Upper_Arm", "Left_Upper_Leg",
+    "Lower_Clothing", "Right_Foot", "Right_Hand", "Right_Lower_Arm",
+    "Right_Lower_Leg", "Right_Shoe", "Right_Sock", "Right_Upper_Arm",
+    "Right_Upper_Leg", "Torso", "Upper_Clothing",
+    "Lower_Lip", "Upper_Lip", "Lower_Teeth", "Upper_Teeth", "Tongue",
+)
+SAPIENS_NAME_TO_IDX = {n: i for i, n in enumerate(SAPIENS_CLASSES)}
+SAPIENS_HAIR_CLASS = SAPIENS_NAME_TO_IDX["Hair"]
+
+# Class sets per pipeline mode. "modesty" blurs hair + exposed-skin classes
+# but leaves Face_Neck (face) and clothing classes visible.
+SAPIENS_CLASS_SETS: dict[str, set[str]] = {
+    "hair": {"Hair"},
+    "modesty": {
+        "Hair", "Torso",
+        "Left_Hand", "Left_Foot", "Left_Lower_Arm", "Left_Upper_Arm",
+        "Left_Lower_Leg", "Left_Upper_Leg",
+        "Right_Hand", "Right_Foot", "Right_Lower_Arm", "Right_Upper_Arm",
+        "Right_Lower_Leg", "Right_Upper_Leg",
+    },
+}
+
+# Multi-concept text-prompt sets for SAM 3.
+SAM3_PROMPT_SETS: dict[str, list[str]] = {
+    "hair": ["hair"],
+    "modesty": [
+        "hair", "exposed skin", "bare shoulders", "neckline",
+        "exposed chest", "midriff", "exposed arms", "exposed legs",
+    ],
+}
 
 SAPIENS_CHECKPOINTS = {
     "0.3b": ("facebook/sapiens-seg-0.3b-torchscript",
@@ -188,14 +235,26 @@ def _letterbox(image: Image.Image, target_h: int, target_w: int):
 
 
 class SapiensSegmenter:
-    def __init__(self, size: str = "2b", device: str | None = None):
+    def __init__(self, size: str = "2b", device: str | None = None,
+                 target_classes: set[str] | None = None):
         from huggingface_hub import hf_hub_download
 
         if size not in SAPIENS_CHECKPOINTS:
             raise ValueError(f"unknown sapiens size {size!r}")
         self.size = size
         self.device = pick_device(device)
-        self.name = f"sapiens-{size}"
+        # Default target = just Hair (single-class behaviour).
+        if target_classes is None:
+            target_classes = SAPIENS_CLASS_SETS["hair"]
+        self.target_class_names = sorted(target_classes)
+        unknown = set(target_classes) - set(SAPIENS_NAME_TO_IDX)
+        if unknown:
+            raise ValueError(f"unknown sapiens classes: {unknown}")
+        self.target_class_indices = np.array(
+            [SAPIENS_NAME_TO_IDX[n] for n in self.target_class_names],
+            dtype=np.int64,
+        )
+        self.name = f"sapiens-{size}:{'+'.join(self.target_class_names)}"
         repo_id, filename = SAPIENS_CHECKPOINTS[size]
         log.info(f"loading {self.name} from {repo_id}/{filename} on {self.device}")
         path = hf_hub_download(repo_id=repo_id, filename=filename)
@@ -218,7 +277,8 @@ class SapiensSegmenter:
             mode="bilinear", align_corners=False,
         )
         labels = logits.argmax(dim=1)[0].cpu().numpy()
-        return ((labels == SAPIENS_HAIR_CLASS).astype(np.uint8) * 255)
+        mask = np.isin(labels, self.target_class_indices)
+        return (mask.astype(np.uint8) * 255)
 
 
 # ───────────────────────── SegFormer fallback segmenter ─────────────────────────
@@ -320,15 +380,25 @@ class FeatherMatter:
 
 # ───────────────────────── builders with fallback ─────────────────────────
 
+PIPELINE_MODES = ("hair", "modesty")
+
+
 def build_segmenter(prefer: str = "sam3", sapiens_size: str = "2b",
                     device: str | None = None,
-                    sam3_version: str = "sam3.1") -> Segmenter:
+                    sam3_version: str = "sam3.1",
+                    mode: str = "hair") -> Segmenter:
     """Try the requested model first; cascade through fallbacks on failure.
 
-    Default cascade order: sapiens → segformer (both fully open, no HF approval).
-    Picking 'sam3' adds it on top: sam3 → sapiens → segformer.
+    Default cascade order for prefer="sam3": sam3 → sapiens → segformer.
+    `mode` selects which classes / prompts the segmenter is configured for:
+        - "hair":     blur hair only
+        - "modesty":  blur hair + every exposed-skin body class.
+                      SegFormer face-parsing has no body classes, so on this
+                      mode it gets dropped from the fallback chain.
     """
-    chain = []
+    if mode not in PIPELINE_MODES:
+        raise ValueError(f"unknown mode {mode!r}; valid: {PIPELINE_MODES}")
+
     if prefer == "sam3":
         chain = ["sam3", "sapiens", "segformer"]
     elif prefer == "sapiens":
@@ -338,13 +408,30 @@ def build_segmenter(prefer: str = "sam3", sapiens_size: str = "2b",
     else:
         raise ValueError(f"unknown segmenter {prefer!r}")
 
+    if mode == "modesty":
+        # SegFormer face-parsing knows about hair but not about arms / legs
+        # / torso, so it would silently produce a hair-only mask in modesty
+        # mode and mislead the user. Drop it.
+        chain = [c for c in chain if c != "segformer"]
+        if not chain:
+            raise RuntimeError("modesty mode requires sapiens or sam3, "
+                               "but the user-chosen segmenter is segformer")
+
     last_err: Exception | None = None
     for choice in chain:
         try:
             if choice == "sam3":
-                return Sam3Segmenter(device=device, version=sam3_version)
+                return Sam3Segmenter(
+                    device=device,
+                    version=sam3_version,
+                    text_prompt=SAM3_PROMPT_SETS[mode],
+                )
             if choice == "sapiens":
-                return SapiensSegmenter(size=sapiens_size, device=device)
+                return SapiensSegmenter(
+                    size=sapiens_size,
+                    device=device,
+                    target_classes=SAPIENS_CLASS_SETS[mode],
+                )
             if choice == "segformer":
                 return SegFormerSegmenter(device=device)
         except Exception as e:
@@ -400,7 +487,9 @@ class BlurResult:
     alpha: Image.Image         # soft alpha matte (uint8 L)
     segmenter: str             # which segmenter actually ran
     matter: str                # which matter actually ran
-    coverage: float            # fraction of image flagged as hair (0..1)
+    coverage: float            # fraction of image flagged for blur (0..1)
+    mode: str                  # "hair" or "modesty"
+    woman_check: float | None  # fraction "woman" was detected on, or None
 
 
 class HairBlurPipeline:
@@ -412,23 +501,45 @@ class HairBlurPipeline:
                  prefer_matter: str = "matanyone",
                  device: str | None = None,
                  feather_radius: float = 4.0,
-                 sam3_version: str = "sam3.1"):
+                 sam3_version: str = "sam3.1",
+                 mode: str = "hair"):
+        if mode not in PIPELINE_MODES:
+            raise ValueError(f"unknown mode {mode!r}; valid: {PIPELINE_MODES}")
+        self.mode = mode
         self.segmenter = segmenter or build_segmenter(
-            prefer_segmenter, sapiens_size, device, sam3_version=sam3_version
+            prefer_segmenter, sapiens_size, device,
+            sam3_version=sam3_version, mode=mode,
         )
         self.matter = matter or build_matter(prefer_matter, feather_radius)
 
     def __call__(self, image: Image.Image, blur_radius: float = 25.0,
-                 do_clean: bool = True) -> BlurResult:
+                 do_clean: bool = True,
+                 check_woman: bool = False,
+                 woman_threshold: float = 0.01) -> BlurResult:
         if image.mode != "RGB":
             image = image.convert("RGB")
+
+        woman_cov: float | None = None
+        if check_woman:
+            if not isinstance(self.segmenter, Sam3Segmenter):
+                log.warning("woman check requested but only SAM 3 supports it; "
+                            "skipping check")
+            else:
+                woman_cov = self.segmenter.detect(image, "woman")
+                log.info(f"woman coverage: {woman_cov:.2%}")
+                if woman_cov < woman_threshold:
+                    log.warning(
+                        f"no female silhouette detected (woman coverage "
+                        f"{woman_cov:.2%} < {woman_threshold:.2%}); "
+                        f"running blur anyway"
+                    )
 
         mask = self.segmenter.segment(image)
         if do_clean:
             mask = clean_mask(mask)
         coverage = float((mask > 127).mean())
         if coverage < 1e-4:
-            log.warning(f"hair coverage {coverage:.4%}; mask may be empty")
+            log.warning(f"target coverage {coverage:.4%}; mask may be empty")
 
         alpha = self.matter.matte(image, mask)
         out = composite_blur(image, alpha, blur_radius=blur_radius)
@@ -439,4 +550,6 @@ class HairBlurPipeline:
             segmenter=self.segmenter.name,
             matter=self.matter.name,
             coverage=coverage,
+            mode=self.mode,
+            woman_check=woman_cov,
         )
