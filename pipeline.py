@@ -76,7 +76,7 @@ class Sam3Segmenter:
     def __init__(self,
                  device: str | None = None,
                  version: str = "sam3.1",
-                 text_prompt: str | list[str] = "hair",
+                 text_prompt: str | list[str] | dict | None = None,
                  checkpoint_path: str | None = None):
         try:
             from sam3.model_builder import (
@@ -99,10 +99,26 @@ class Sam3Segmenter:
             log.warning("SAM 3 not stable on MPS; running on CPU instead")
             self.device = "cpu"
         self.version = version
+        # Normalise prompt config into {"targets": [...], "restrict_to": str|None}.
+        if text_prompt is None:
+            text_prompt = "hair"
         if isinstance(text_prompt, str):
-            text_prompt = [text_prompt]
-        self.text_prompts = list(text_prompt)
-        self.name = f"{version}:{'+'.join(self.text_prompts)}"
+            cfg = {"targets": [text_prompt], "restrict_to": None}
+        elif isinstance(text_prompt, list):
+            cfg = {"targets": list(text_prompt), "restrict_to": None}
+        elif isinstance(text_prompt, dict):
+            cfg = {
+                "targets": list(text_prompt.get("targets", ["hair"])),
+                "restrict_to": text_prompt.get("restrict_to"),
+            }
+        else:
+            raise TypeError(f"unsupported text_prompt type: {type(text_prompt)}")
+        self.targets: list[str] = cfg["targets"]
+        self.restrict_to: str | None = cfg["restrict_to"]
+        name = "+".join(self.targets)
+        if self.restrict_to:
+            name += f"@{self.restrict_to}"
+        self.name = f"{version}:{name}"
 
         # Meta's builder only branches on 'cuda'; everything else is CPU.
         build_device = "cuda" if self.device == "cuda" else "cpu"
@@ -132,12 +148,11 @@ class Sam3Segmenter:
         # auto-detect can pick MPS even when model is on CPU.
         self.processor = Sam3Processor(model, device=self.device)
 
-    def _prompt_mask(self, image: Image.Image, prompt: str) -> np.ndarray:
-        """Run SAM 3 once with one text prompt; return bool union mask."""
-        state = self.processor.set_image(image)
-        output = self.processor.set_text_prompt(state=state, prompt=prompt)
+    @staticmethod
+    def _output_to_union(output, h: int, w: int) -> np.ndarray:
+        """Collapse SAM 3 output['masks'] into a bool union mask."""
         masks = output.get("masks") if isinstance(output, dict) else None
-        union = np.zeros((image.height, image.width), dtype=bool)
+        union = np.zeros((h, w), dtype=bool)
         if masks is None:
             return union
         if isinstance(masks, torch.Tensor):
@@ -155,19 +170,53 @@ class Sam3Segmenter:
                 union |= a.astype(bool)
         return union
 
+    def _run_prompt_on_state(self, state, prompt: str, h: int, w: int) -> np.ndarray:
+        """Run one text prompt on a pre-encoded image state; return bool mask.
+
+        We `reset_all_prompts` first so each call gives the mask for *only*
+        the new prompt, never accidentally accumulating across prompts.
+        """
+        self.processor.reset_all_prompts(state)
+        output = self.processor.set_text_prompt(state=state, prompt=prompt)
+        return self._output_to_union(output, h, w)
+
     @torch.inference_mode()
     def segment(self, image: Image.Image) -> np.ndarray:
-        union = np.zeros((image.height, image.width), dtype=bool)
-        for prompt in self.text_prompts:
-            log.info(f"sam3 prompt: {prompt!r}")
-            union |= self._prompt_mask(image, prompt)
-        return union.astype(np.uint8) * 255
+        # Encode the image once; state["backbone_out"] holds the heavy ViT
+        # features. All subsequent prompts are cheap text-only passes.
+        state = self.processor.set_image(image)
+
+        target_union = np.zeros((image.height, image.width), dtype=bool)
+        for prompt in self.targets:
+            log.info(f"sam3 target: {prompt!r}")
+            target_union |= self._run_prompt_on_state(
+                state, prompt, image.height, image.width
+            )
+
+        if self.restrict_to:
+            log.info(f"sam3 restriction: {self.restrict_to!r}")
+            restriction = self._run_prompt_on_state(
+                state, self.restrict_to, image.height, image.width
+            )
+            cov = restriction.mean()
+            if cov < 1e-4:
+                log.warning(
+                    f"restriction prompt {self.restrict_to!r} matched no "
+                    f"pixels ({cov:.4%}); returning empty mask"
+                )
+                return np.zeros((image.height, image.width), dtype=np.uint8)
+            target_union &= restriction
+
+        return target_union.astype(np.uint8) * 255
 
     @torch.inference_mode()
     def detect(self, image: Image.Image, prompt: str) -> float:
         """Return fraction of image covered by `prompt` — for soft checks
         like 'is there a woman in this photo'."""
-        return float(self._prompt_mask(image, prompt).mean())
+        state = self.processor.set_image(image)
+        return float(self._run_prompt_on_state(
+            state, prompt, image.height, image.width
+        ).mean())
 
 
 # ───────────────────────── Sapiens segmenter ─────────────────────────
@@ -202,13 +251,37 @@ SAPIENS_CLASS_SETS: dict[str, set[str]] = {
     },
 }
 
-# Multi-concept text-prompt sets for SAM 3.
-SAM3_PROMPT_SETS: dict[str, list[str]] = {
-    "hair": ["hair"],
-    "modesty": [
-        "hair", "exposed skin", "bare shoulders", "neckline",
-        "exposed chest", "midriff", "exposed arms", "exposed legs",
-    ],
+# SAM 3 prompt configuration per pipeline mode.
+#   targets:     prompts whose masks are union'd to form what gets blurred
+#   restrict_to: optional silhouette prompt — final mask is target ∩ this.
+#                Used for gender-aware modesty so men's hair / clothing
+#                in mixed-gender photos isn't blurred.
+SAM3_PROMPT_SETS: dict[str, dict] = {
+    "hair": {
+        "targets": ["hair"],
+        "restrict_to": None,
+    },
+    "modesty": {
+        # Simple noun prompts work best with SAM 3 (compound phrases like
+        # "hair on a woman" return ~0%). The `restrict_to` intersection
+        # with the "woman" silhouette is what filters out men. We avoid
+        # prompts that match the face (e.g. "exposed skin", "skin"); face
+        # remains visible by design — this matches typical hijab-style
+        # modesty rules where hair and body are covered but face isn't.
+        "targets": [
+            "hair",
+            "bare arms",
+            "bare shoulders",
+            "bare legs",
+            "thighs",
+            "midriff",
+            "neckline",
+            "cleavage",
+            "decolletage",
+            "exposed chest",
+        ],
+        "restrict_to": "woman",
+    },
 }
 
 SAPIENS_CHECKPOINTS = {
