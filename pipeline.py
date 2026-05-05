@@ -233,6 +233,36 @@ class Sam3Segmenter:
         return self._output_to_union(output, h, w)
 
     @torch.inference_mode()
+    def prompt_mask_and_boxes(
+        self, image: Image.Image, prompt: str,
+    ) -> tuple[np.ndarray, list[tuple[int, int, int, int]]]:
+        """Backend-agnostic API: return (bool union mask, list of xyxy boxes).
+
+        Works on the cached image state. HybridSegmenter calls this so the
+        same code path works against either the PyTorch or the MLX SAM 3
+        backend.
+        """
+        state = self.get_image_state(image)
+        self.processor.reset_all_prompts(state)
+        output = self.processor.set_text_prompt(state=state, prompt=prompt)
+        h, w = image.height, image.width
+        mask = self._output_to_union(output, h, w)
+
+        boxes: list[tuple[int, int, int, int]] = []
+        boxes_t = output.get("boxes") if isinstance(output, dict) else None
+        if isinstance(boxes_t, torch.Tensor) and boxes_t.numel() > 0:
+            arr = boxes_t.detach().cpu().numpy()
+            while arr.ndim > 2:
+                arr = arr[0]
+            for b in arr:
+                x1, y1, x2, y2 = (int(round(v)) for v in b[:4].tolist())
+                boxes.append((
+                    max(0, min(w, x1)), max(0, min(h, y1)),
+                    max(0, min(w, x2)), max(0, min(h, y2)),
+                ))
+        return mask, boxes
+
+    @torch.inference_mode()
     def segment(self, image: Image.Image) -> np.ndarray:
         # Cached encoding — single heavy ViT pass per unique image.
         state = self.get_image_state(image)
@@ -268,6 +298,162 @@ class Sam3Segmenter:
         return float(self._run_prompt_on_state(
             state, prompt, image.height, image.width
         ).mean())
+
+
+# ───────────────────────── SAM 3 / 3.1 via mlx-vlm (Apple Silicon) ──────
+
+DEFAULT_MLX_SAM3_PATH = Path(__file__).parent / "models" / "sam3.1-mlx"
+
+
+class Sam3MLXSegmenter:
+    """SAM 3.1 running on Apple Silicon via mlx-vlm.
+
+    Same public surface as the PyTorch `Sam3Segmenter` so HybridSegmenter
+    can use either backend interchangeably:
+        get_image_state(image)
+        prompt_mask_and_boxes(image, prompt)
+        segment(image)
+        detect(image, prompt)
+
+    Heavy ViT backbone is encoded once per image (cached by content hash);
+    each text prompt only runs the cheap FPN neck + DETR + mask decoder.
+    On M-series Macs this brings SAM 3 from ~25 s (PyTorch CPU) to ~3-4 s
+    cold and ~0.5-1 s per additional prompt.
+    """
+
+    def __init__(self,
+                 model_path: str | Path | None = None,
+                 score_threshold: float = 0.5,
+                 state_cache_size: int = 4):
+        try:
+            import mlx.core as mx
+            from mlx_vlm.utils import load_model
+            from mlx_vlm.models.sam3.generate import Sam3Predictor
+            from mlx_vlm.models.sam3_1.processing_sam3_1 import Sam31Processor
+            from mlx_vlm.models.sam3_1.generate import (
+                _get_backbone_features,
+                _detect_with_backbone,
+            )
+        except ImportError as exc:
+            raise RuntimeError(
+                "mlx-vlm not installed. Run:\n"
+                "  pip install 'mlx-vlm>=0.4.3'"
+            ) from exc
+
+        path = Path(model_path) if model_path else DEFAULT_MLX_SAM3_PATH
+        if not (path / "config.json").exists():
+            raise FileNotFoundError(
+                f"MLX SAM 3.1 checkpoint not found at {path}. "
+                f"Download with: hf download mlx-community/sam3.1-bf16 "
+                f"--local-dir {path}"
+            )
+
+        self._mx = mx
+        self.path = path
+        self.score_threshold = score_threshold
+        self.name = f"sam3.1-mlx"
+
+        log.info(f"loading {self.name} from {path}…")
+        self.model = load_model(path)
+        self.processor = Sam31Processor.from_pretrained(str(path))
+        self.predictor = Sam3Predictor(
+            self.model, self.processor, score_threshold=score_threshold,
+        )
+        self._get_backbone = _get_backbone_features
+        self._detect_with_backbone = _detect_with_backbone
+
+        self._state_cache: dict[str, dict] = {}
+        self._state_cache_lock = threading.Lock()
+        self._state_cache_max = state_cache_size
+
+    def get_image_state(self, image: Image.Image) -> dict:
+        """Encode ViT backbone once per unique image; cached by content hash."""
+        h = image_content_hash(image)
+        with self._state_cache_lock:
+            cached = self._state_cache.get(h)
+            if cached is not None:
+                log.info(f"sam3-mlx state cache hit ({h[:8]})")
+                return cached
+        log.info(f"sam3-mlx encoding image ({h[:8]})…")
+        inputs = self.processor.preprocess_image(image)
+        pixel_values = self._mx.array(inputs["pixel_values"])
+        backbone = self._get_backbone(self.model, pixel_values)
+        state = {"backbone": backbone, "size": image.size}
+        with self._state_cache_lock:
+            if len(self._state_cache) >= self._state_cache_max:
+                self._state_cache.pop(next(iter(self._state_cache)))
+            self._state_cache[h] = state
+        return state
+
+    def prompt_mask_and_boxes(
+        self, image: Image.Image, prompt: str,
+    ) -> tuple[np.ndarray, list[tuple[int, int, int, int]]]:
+        """Same return shape as Sam3Segmenter.prompt_mask_and_boxes."""
+        state = self.get_image_state(image)
+        result = self._detect_with_backbone(
+            self.predictor, state["backbone"], [prompt],
+            state["size"], self.score_threshold,
+        )
+
+        h, w = image.height, image.width
+        union = np.zeros((h, w), dtype=bool)
+        masks = result.masks
+        if masks is not None and len(masks) > 0:
+            for m in masks:
+                arr = np.asarray(m)
+                bm = arr if arr.dtype == bool else (arr > 0)
+                if bm.shape != (h, w):
+                    bm = (
+                        np.array(
+                            Image.fromarray(bm.astype(np.uint8) * 255).resize((w, h))
+                        ) > 127
+                    )
+                union |= bm
+
+        boxes: list[tuple[int, int, int, int]] = []
+        if result.boxes is not None and len(result.boxes) > 0:
+            for b in np.asarray(result.boxes):
+                x1, y1, x2, y2 = (int(round(float(v))) for v in b[:4])
+                boxes.append((
+                    max(0, min(w, x1)), max(0, min(h, y1)),
+                    max(0, min(w, x2)), max(0, min(h, y2)),
+                ))
+        return union, boxes
+
+    def segment(self, image: Image.Image,
+                targets: list[str] | None = None,
+                restrict_to: str | None = None) -> np.ndarray:
+        """Standalone modesty pass — multi-prompt union ∩ optional restriction.
+
+        HybridSegmenter doesn't call this; it's here so the MLX segmenter
+        can stand on its own as a fallback for the cascade in build_segmenter.
+        """
+        if targets is None:
+            targets = list(SAM3_MODESTY_TARGETS)
+        if restrict_to is None:
+            restrict_to = SAM3_MODESTY_RESTRICT_TO
+
+        h, w = image.height, image.width
+        union = np.zeros((h, w), dtype=bool)
+        for prompt in targets:
+            log.info(f"sam3-mlx target: {prompt!r}")
+            mask, _ = self.prompt_mask_and_boxes(image, prompt)
+            union |= mask
+        if restrict_to:
+            log.info(f"sam3-mlx restriction: {restrict_to!r}")
+            r, _ = self.prompt_mask_and_boxes(image, restrict_to)
+            if r.mean() < 1e-4:
+                log.warning(
+                    f"sam3-mlx: '{restrict_to}' silhouette empty; empty mask"
+                )
+                return np.zeros((h, w), dtype=np.uint8)
+            union &= r
+        return union.astype(np.uint8) * 255
+
+    def detect(self, image: Image.Image, prompt: str) -> float:
+        """Coverage check — 'is there a woman in this photo' style soft test."""
+        mask, _ = self.prompt_mask_and_boxes(image, prompt)
+        return float(mask.mean())
 
 
 # ───────────────────────── Sapiens segmenter ─────────────────────────
@@ -412,6 +598,89 @@ class SapiensSegmenter:
         return results
 
 
+# ───────────────────────── SegFormer-ATR (clothes/parts) segmenter ─────────────────────────
+
+ATR_CLASSES = (
+    "Background", "Hat", "Hair", "Sunglasses", "Upper-clothes",
+    "Skirt", "Pants", "Dress", "Belt", "Left-shoe", "Right-shoe",
+    "Face", "Left-leg", "Right-leg", "Left-arm", "Right-arm",
+    "Bag", "Scarf",
+)
+ATR_NAME_TO_IDX = {n: i for i, n in enumerate(ATR_CLASSES)}
+
+# ATR has no midriff/cleavage/neckline labels — those still need SAM 3
+# (or a fine-tuned head) if you care about them.
+ATR_MODESTY_CLASSES: set[str] = {
+    "Hair", "Left-arm", "Right-arm", "Left-leg", "Right-leg",
+}
+
+
+class SegformerATRSegmenter:
+    """`mattmdjaga/segformer_b2_clothes` — SegFormer-B2 fine-tuned on ATR.
+
+    18 classes (hair, face, body parts, clothing). ~80M parameters — about
+    10× lighter than Sapiens-1b at comparable quality on the hair + bare
+    arms/legs class set.
+    """
+
+    def __init__(self, device: str | None = None,
+                 target_classes: set[str] | None = None,
+                 repo_id: str = "mattmdjaga/segformer_b2_clothes"):
+        from transformers import SegformerForSemanticSegmentation, SegformerImageProcessor
+
+        self.device = pick_device(device)
+        self.repo_id = repo_id
+        if target_classes is None:
+            target_classes = ATR_MODESTY_CLASSES
+        unknown = set(target_classes) - set(ATR_NAME_TO_IDX)
+        if unknown:
+            raise ValueError(f"unknown ATR classes: {unknown}")
+        self.target_class_names = sorted(target_classes)
+        self.target_class_indices = np.array(
+            [ATR_NAME_TO_IDX[n] for n in self.target_class_names],
+            dtype=np.int64,
+        )
+        self.name = f"segformer-atr:{'+'.join(self.target_class_names)}"
+        log.info(f"loading {self.name} from {repo_id} on {self.device}")
+        self.processor = SegformerImageProcessor.from_pretrained(repo_id)
+        self.model = (SegformerForSemanticSegmentation
+                      .from_pretrained(repo_id)
+                      .to(self.device).eval())
+
+    @torch.inference_mode()
+    def segment(self, image: Image.Image) -> np.ndarray:
+        inputs = self.processor(images=image, return_tensors="pt").to(self.device)
+        logits = self.model(**inputs).logits
+        upsampled = torch.nn.functional.interpolate(
+            logits, size=(image.height, image.width),
+            mode="bilinear", align_corners=False,
+        )
+        labels = upsampled.argmax(dim=1)[0].cpu().numpy()
+        mask = np.isin(labels, self.target_class_indices)
+        return mask.astype(np.uint8) * 255
+
+    @torch.inference_mode()
+    def segment_batch(self, images: list[Image.Image]) -> list[np.ndarray]:
+        """Batch version — N images in one forward, used by HybridSegmenter
+        smart-crop pass. SegformerImageProcessor handles per-image resize +
+        normalization and pads tensors to the largest in the batch."""
+        if not images:
+            return []
+        inputs = self.processor(images=images, return_tensors="pt").to(self.device)
+        logits = self.model(**inputs).logits  # (B, C, H/4, W/4)
+        results = []
+        for i, img in enumerate(images):
+            upsampled = torch.nn.functional.interpolate(
+                logits[i:i + 1],
+                size=(img.height, img.width),
+                mode="bilinear", align_corners=False,
+            )
+            labels = upsampled.argmax(dim=1)[0].cpu().numpy()
+            results.append(np.isin(labels, self.target_class_indices)
+                           .astype(np.uint8) * 255)
+        return results
+
+
 # ───────────────────────── SegFormer fallback segmenter ─────────────────────────
 
 class SegFormerSegmenter:
@@ -511,19 +780,61 @@ class FeatherMatter:
 
 # ───────────────────────── Hybrid: Sapiens body + SAM 3 gender ──────────
 
+def _build_body_segmenter(backend: str, sapiens_size: str,
+                          device: str | None) -> Segmenter:
+    """Body parser used by HybridSegmenter. Order: ATR (small + fast) →
+    Sapiens (heavy + thorough). ATR covers Hair + arms + legs which is
+    enough for modesty mode; Sapiens has Torso/Hand/Foot too but is
+    much slower and less accurate on hair for portraits."""
+    if backend == "atr":
+        try:
+            return SegformerATRSegmenter(device=device)
+        except Exception as e:
+            log.warning(f"ATR body backend unavailable ({e}); using sapiens")
+    return SapiensSegmenter(
+        size=sapiens_size, device=device,
+        target_classes=SAPIENS_MODESTY_CLASSES,
+    )
+
+
+def _build_sam3_segmenter(backend: str, sam3_version: str,
+                          device: str | None,
+                          mlx_model_path: str | Path | None = None):
+    """SAM 3 backend selector. Order: MLX (fast on Apple Silicon) →
+    PyTorch (CPU-only on Mac, slow but always works once weights are
+    downloaded)."""
+    if backend == "mlx":
+        try:
+            return Sam3MLXSegmenter(model_path=mlx_model_path)
+        except Exception as e:
+            log.warning(f"MLX SAM 3 unavailable ({e}); falling back to PyTorch")
+    return Sam3Segmenter(
+        device=device, version=sam3_version,
+        text_prompt={"targets": list(SAM3_MODESTY_TARGETS),
+                     "restrict_to": SAM3_MODESTY_RESTRICT_TO},
+    )
+
+
 class HybridSegmenter:
     """Best-quality modesty segmenter for mixed-gender / multi-person photos.
 
-    body   = Sapiens parsing (modesty class set: hair + skin classes)
+    body   = ATR or Sapiens (hair + skin classes)
     SAM 3  = multi-prompt union (hair, bare arms/legs/..., neckline, ...)
     gender = SAM 3 silhouette of `restrict_to` (default "woman")
     final  = (body ∪ SAM 3) ∩ gender
+
+    Both `body_backend` and `sam3_backend` are pluggable. Defaults are
+    chosen for Apple Silicon: ATR (~0.2 s on MPS) + MLX SAM 3 (~3-4 s
+    cold + ~0.5 s per prompt).
     """
 
     def __init__(self,
+                 body_backend: str = "atr",
+                 sam3_backend: str = "mlx",
                  sapiens_size: str = "1b",
                  device: str | None = None,
                  sam3_version: str = "sam3.1",
+                 mlx_model_path: str | Path | None = None,
                  restrict_to: str = SAM3_MODESTY_RESTRICT_TO,
                  sam3_targets: list[str] | None = None,
                  smart_crop: bool = False,
@@ -532,22 +843,13 @@ class HybridSegmenter:
                  min_crop_side: int = 64,
                  max_crops_per_batch: int = 4,
                  max_total_crops: int = 24):
-        self.body = SapiensSegmenter(
-            size=sapiens_size,
-            device=device,
-            target_classes=SAPIENS_MODESTY_CLASSES,
-        )
-        # SAM 3 prompts to run *in addition* to the Sapiens body parsing —
-        # patch up things Sapiens misses on small bodies in crowded photos.
+        self.body = _build_body_segmenter(body_backend, sapiens_size, device)
         if sam3_targets is None:
             sam3_targets = list(SAM3_MODESTY_TARGETS)
         self.sam3_targets: list[str] = sam3_targets
-        # The Sam3Segmenter itself isn't used via .segment() here — we just
-        # need its loaded model and processor for direct prompt calls.
-        self.sam3 = Sam3Segmenter(
-            device=device,
-            version=sam3_version,
-            text_prompt={"targets": sam3_targets, "restrict_to": None},
+        # The chosen SAM 3 backend exposes prompt_mask_and_boxes(image, prompt).
+        self.sam3 = _build_sam3_segmenter(
+            sam3_backend, sam3_version, device, mlx_model_path,
         )
         self.restrict_to = restrict_to
         self.smart_crop = smart_crop
@@ -558,7 +860,7 @@ class HybridSegmenter:
         self.max_total_crops = max_total_crops
         self.name = (
             f"hybrid:{self.body.name}"
-            f"+{self.sam3.version}:{'+'.join(sam3_targets)}"
+            f"+{self.sam3.name}:{'+'.join(sam3_targets)}"
             f"@{restrict_to}"
             + ("+smartcrop" if smart_crop else "")
         )
@@ -573,36 +875,14 @@ class HybridSegmenter:
             instances:  list of per-instance (x1, y1, x2, y2) bboxes for
                         `restrict_to` — used by smart-crop pass
         """
-        state = self.sam3.get_image_state(image)
         h, w = image.height, image.width
-
         sam3_union = np.zeros((h, w), dtype=bool)
         for prompt in self.sam3_targets:
             log.info(f"hybrid sam3 target: {prompt!r}")
-            sam3_union |= self.sam3._run_prompt_on_state(state, prompt, h, w)
-
-        # `restrict_to` pass — get gender mask AND per-instance bboxes
-        # (last prompt run, so output stays in state for box extraction).
-        self.sam3.processor.reset_all_prompts(state)
-        output = self.sam3.processor.set_text_prompt(
-            state=state, prompt=self.restrict_to
-        )
-        gender = self.sam3._output_to_union(output, h, w)
-
-        instances: list[tuple[int, int, int, int]] = []
-        boxes_t = output.get("boxes") if isinstance(output, dict) else None
-        if isinstance(boxes_t, torch.Tensor) and boxes_t.numel() > 0:
-            arr = boxes_t.detach().cpu().numpy()
-            while arr.ndim > 2:
-                arr = arr[0]
-            for box in arr:
-                x1, y1, x2, y2 = (int(round(v)) for v in box[:4].tolist())
-                instances.append((
-                    max(0, min(w, x1)),
-                    max(0, min(h, y1)),
-                    max(0, min(w, x2)),
-                    max(0, min(h, y2)),
-                ))
+            mask, _ = self.sam3.prompt_mask_and_boxes(image, prompt)
+            sam3_union |= mask
+        log.info(f"hybrid sam3 restriction: {self.restrict_to!r}")
+        gender, instances = self.sam3.prompt_mask_and_boxes(image, self.restrict_to)
         return sam3_union, gender, instances
 
     def _smart_crop_pass(self, image: Image.Image,
@@ -677,14 +957,14 @@ class HybridSegmenter:
 
     def segment(self, image: Image.Image) -> np.ndarray:
         H, W = image.height, image.width
-        # Sapiens lives on MPS (or CUDA), SAM 3 lives on CPU — different
-        # devices, so PyTorch can run them concurrently. Both ops release
-        # the GIL during native inference.
-        with ThreadPoolExecutor(max_workers=2) as ex:
-            body_fut = ex.submit(self.body.segment, image)
-            sam3_fut = ex.submit(self._run_sam3, image)
-            body_full = body_fut.result()
-            sam3_union, gender, instances = sam3_fut.result()
+        # We used to run body+SAM 3 concurrently in a ThreadPoolExecutor
+        # (different devices → no contention). With ATR (~0.2 s on MPS)
+        # and MLX SAM 3 (~3-10 s) the body pass is so cheap that
+        # parallelism would save < 0.5 s, and MLX has thread-local GPU
+        # streams that crash when called from worker threads. So we go
+        # sequential — body first, then SAM 3.
+        body_full = self.body.segment(image)
+        sam3_union, gender, instances = self._run_sam3(image)
 
         if gender.mean() < 1e-4:
             log.warning(
@@ -710,16 +990,21 @@ class HybridSegmenter:
 def build_segmenter(prefer: str = "hybrid", sapiens_size: str = "1b",
                     device: str | None = None,
                     sam3_version: str = "sam3.1",
-                    smart_crop: bool = False) -> Segmenter:
+                    smart_crop: bool = False,
+                    body_backend: str = "atr",
+                    sam3_backend: str = "mlx",
+                    mlx_model_path: str | Path | None = None) -> Segmenter:
     """Build a segmenter; cascade through fallbacks on init failure.
 
-    Pipeline only has the modesty mode now, so SegFormer (face-only) is
-    always dropped from the chain.
+    body_backend  — "atr" (~80M, ~0.2 s on MPS) or "sapiens" (~4 GB, ~12 s)
+    sam3_backend  — "mlx" (Apple Silicon native) or "pytorch" (CPU only)
     """
     if prefer == "hybrid":
-        chain = ["hybrid", "sam3", "sapiens"]
+        chain = ["hybrid", "sam3", "atr", "sapiens"]
     elif prefer == "sam3":
-        chain = ["sam3", "sapiens"]
+        chain = ["sam3", "atr", "sapiens"]
+    elif prefer == "atr":
+        chain = ["atr", "sapiens"]
     elif prefer == "sapiens":
         chain = ["sapiens"]
     else:
@@ -730,20 +1015,20 @@ def build_segmenter(prefer: str = "hybrid", sapiens_size: str = "1b",
         try:
             if choice == "hybrid":
                 return HybridSegmenter(
+                    body_backend=body_backend,
+                    sam3_backend=sam3_backend,
                     sapiens_size=sapiens_size,
                     device=device,
                     sam3_version=sam3_version,
+                    mlx_model_path=mlx_model_path,
                     smart_crop=smart_crop,
                 )
             if choice == "sam3":
-                return Sam3Segmenter(
-                    device=device,
-                    version=sam3_version,
-                    text_prompt={
-                        "targets": list(SAM3_MODESTY_TARGETS),
-                        "restrict_to": SAM3_MODESTY_RESTRICT_TO,
-                    },
+                return _build_sam3_segmenter(
+                    sam3_backend, sam3_version, device, mlx_model_path,
                 )
+            if choice == "atr":
+                return SegformerATRSegmenter(device=device)
             if choice == "sapiens":
                 return SapiensSegmenter(
                     size=sapiens_size,
@@ -818,10 +1103,15 @@ class HairBlurPipeline:
                  feather_radius: float = 4.0,
                  sam3_version: str = "sam3.1",
                  smart_crop: bool = False,
+                 body_backend: str = "atr",
+                 sam3_backend: str = "mlx",
+                 mlx_model_path: str | Path | None = None,
                  mask_cache_size: int = 4):
         self.segmenter = segmenter or build_segmenter(
             prefer_segmenter, sapiens_size, device,
             sam3_version=sam3_version, smart_crop=smart_crop,
+            body_backend=body_backend, sam3_backend=sam3_backend,
+            mlx_model_path=mlx_model_path,
         )
         self.matter = matter or build_matter(prefer_matter, feather_radius)
         # Cache the final (mask, alpha) per image hash. The slow stages —

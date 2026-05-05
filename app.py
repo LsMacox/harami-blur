@@ -37,10 +37,12 @@ _PIPE_KEY: Optional[tuple] = None
 
 def get_pipeline(sapiens_size: str, segmenter: str, matter: str,
                  device: str, feather_radius: float,
-                 sam3_version: str, smart_crop: bool) -> HairBlurPipeline:
+                 sam3_version: str, smart_crop: bool,
+                 body_backend: str, sam3_backend: str) -> HairBlurPipeline:
     global _PIPE, _PIPE_KEY
     key = (sapiens_size, segmenter, matter, device,
-           round(feather_radius, 2), sam3_version, smart_crop)
+           round(feather_radius, 2), sam3_version, smart_crop,
+           body_backend, sam3_backend)
     with _PIPE_LOCK:
         if _PIPE is None or _PIPE_KEY != key:
             _PIPE = HairBlurPipeline(
@@ -51,6 +53,8 @@ def get_pipeline(sapiens_size: str, segmenter: str, matter: str,
                 feather_radius=feather_radius,
                 sam3_version=sam3_version,
                 smart_crop=smart_crop,
+                body_backend=body_backend,
+                sam3_backend=sam3_backend,
             )
             _PIPE_KEY = key
         return _PIPE
@@ -58,7 +62,7 @@ def get_pipeline(sapiens_size: str, segmenter: str, matter: str,
 
 def process(image, blur_radius, segmenter, sapiens_size, sam3_version,
             matter, feather_radius, device_choice, do_clean, check_woman,
-            smart_crop,
+            smart_crop, body_backend, sam3_backend,
             progress=gr.Progress(track_tqdm=False)):
     if image is None:
         raise gr.Error("Сначала загрузите изображение.")
@@ -71,7 +75,8 @@ def process(image, blur_radius, segmenter, sapiens_size, sam3_version,
 
     progress(0.05, desc="Загружаю модели…")
     pipe = get_pipeline(sapiens_size, segmenter, matter, device or "",
-                        feather_radius, sam3_version, smart_crop)
+                        feather_radius, sam3_version, smart_crop,
+                        body_backend, sam3_backend)
 
     if check_woman:
         progress(0.2, desc="Проверяю, что на фото женщина…")
@@ -139,10 +144,10 @@ def build_ui() -> gr.Blocks:
             "Размывает волосы и любые открытые участки кожи у женщин на фото "
             "(плечи, руки, шея, ноги, торс). Лицо остаётся чётким, мужчины "
             "не затрагиваются.  \n"
-            "Стек: **Sapiens-1B** (28-класс body parsing) + "
-            "**SAM 3.1** (мульти-промпт + силуэт «woman») + "
-            "**MatAnyone** (alpha-matting). "
-            "При сбое любого компонента работает каскадный fallback."
+            "Стек по умолчанию (Apple Silicon native): **SegFormer-B2 ATR** "
+            "(body parsing, ~0.2 с) + **SAM 3.1 MLX** (multi-prompt + силуэт "
+            "«woman», ~3-4 с cold) + **MatAnyone** (alpha-matting). "
+            "Кэш по hash картинки — повторный клик 30 мс."
         )
 
         with gr.Row():
@@ -164,14 +169,14 @@ def build_ui() -> gr.Blocks:
                              "применяется. Работает только когда сегментатор = sam3.",
                     )
                     smart_crop = gr.Checkbox(
-                        value=False,
-                        label="Smart per-person crop (медленно на Mac)",
-                        info="Дополнительный Sapiens-проход по каждому "
-                             "найденному силуэту женщины. Улучшает покрытие "
-                             "рук/ног на групповых фото с маленькими телами, "
-                             "но на Mac MPS каждый кроп идёт ~20 сек "
-                             "(нативно работает только на CUDA). "
-                             "По умолчанию выключено.",
+                        value=True,
+                        label="Smart per-person crop",
+                        info="Дополнительный body-проход по каждому "
+                             "найденному силуэту женщины — улучшает "
+                             "покрытие рук/ног на групповых фото с "
+                             "маленькими телами. С ATR (~0.2 с/проход) "
+                             "это дёшево; на Sapiens — медленно. "
+                             "Выключи если хочешь чуть быстрее.",
                     )
                     blur_radius = gr.Slider(
                         1, 100, value=25, step=1,
@@ -180,14 +185,30 @@ def build_ui() -> gr.Blocks:
                              "20–40 — заметный блюр, 60+ — однородное пятно.",
                     )
                     segmenter = gr.Radio(
-                        choices=["hybrid", "sam3", "sapiens"],
+                        choices=["hybrid", "sam3", "atr", "sapiens"],
                         value="hybrid",
                         label="Сегментатор (с автоматическим fallback)",
-                        info="hybrid — Sapiens body + SAM 3 multi-prompt + "
-                             "SAM 3 силуэт «woman». Лучший выбор. "
-                             "sam3 — только SAM 3 с текстовыми промптами. "
-                             "sapiens — только Sapiens (без gender-фильтра — "
-                             "затронет и мужчин).",
+                        info="hybrid (рекомендуется) — body parser + SAM 3 "
+                             "multi-prompt + SAM 3 силуэт «woman». "
+                             "sam3 — только SAM 3. atr / sapiens — только "
+                             "body parser, без gender-фильтра (мужчин тоже трогает).",
+                    )
+                    body_backend = gr.Radio(
+                        choices=["atr", "sapiens"],
+                        value="atr",
+                        label="Body backend (внутри hybrid)",
+                        info="atr — SegFormer-B2 ATR (~80M, ~0.2 с на MPS). "
+                             "sapiens — Sapiens-1B (~4 ГБ, ~12 с на MPS, "
+                             "больше классов но медленнее и хуже на портретных волосах).",
+                    )
+                    sam3_backend = gr.Radio(
+                        choices=["mlx", "pytorch"],
+                        value="mlx",
+                        label="SAM 3 backend",
+                        info="mlx — Apple Silicon native через mlx-vlm "
+                             "(~3-4 с cold + кэш для повторных промптов). "
+                             "pytorch — на Mac CPU only ~25 с. "
+                             "Если MLX-чекпоинт не скачан, авто-откат на pytorch.",
                     )
                     sam3_version = gr.Radio(
                         choices=["sam3.1", "sam3"],
@@ -270,7 +291,7 @@ def build_ui() -> gr.Blocks:
             process,
             inputs=[inp, blur_radius, segmenter, sapiens_size, sam3_version,
                     matter, feather_radius, device_choice, do_clean, check_woman,
-                    smart_crop],
+                    smart_crop, body_backend, sam3_backend],
             outputs=[out_image, out_mask, out_alpha, info],
         )
 
