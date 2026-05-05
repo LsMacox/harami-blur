@@ -24,3 +24,10 @@ models/
 *.safetensors
 *.pt
 *.pt2
+test/bench_*
+test/out_atr_mlx*
+test/out_modesty_v*.jpg
+test/out_hybrid.jpg
+test/out_optimized.jpg
+test/out_sam3_full.jpg
+test/out_segformer_matanyone.jpg

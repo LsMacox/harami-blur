@@ -23,10 +23,17 @@ def main() -> None:
                    choices=list(SAPIENS_CHECKPOINTS.keys()),
                    help="Sapiens-seg variant; bigger = more accurate, more VRAM")
     p.add_argument("--segmenter", default="hybrid",
-                   choices=["hybrid", "sam3", "sapiens"],
+                   choices=["hybrid", "sam3", "atr", "sapiens"],
                    help="Force a segmenter; falls back automatically on load "
-                        "failure. 'hybrid' = Sapiens body + SAM 3 multi-prompt "
+                        "failure. 'hybrid' = body parser + SAM 3 multi-prompt "
                         "+ SAM 3 woman silhouette (recommended).")
+    p.add_argument("--body-backend", default="atr", choices=["atr", "sapiens"],
+                   help="Body parser inside hybrid: 'atr' "
+                        "(mattmdjaga/segformer_b2_clothes, ~80M, ~0.2 s on MPS) "
+                        "or 'sapiens' (~4 GB, ~12 s, more classes).")
+    p.add_argument("--sam3-backend", default="mlx", choices=["mlx", "pytorch"],
+                   help="SAM 3 backend: 'mlx' (Apple Silicon native, ~3-4 s) "
+                        "or 'pytorch' (CPU only, ~25 s on Mac).")
     p.add_argument("--sam3-version", default="sam3.1",
                    choices=["sam3", "sam3.1"],
                    help="Which SAM 3 checkpoint to use via Meta's sam3 package")
@@ -56,6 +63,8 @@ def main() -> None:
         feather_radius=args.feather_radius,
         sam3_version=args.sam3_version,
         smart_crop=args.smart_crop,
+        body_backend=args.body_backend,
+        sam3_backend=args.sam3_backend,
     )
     image = Image.open(args.input).convert("RGB")
     result = pipe(image, blur_radius=args.blur_radius,
