@@ -42,6 +42,10 @@ def main() -> None:
     p.add_argument("--check-woman", action="store_true",
                    help="Run SAM 3 with prompt 'woman' first; warn if no "
                         "female silhouette is detected. Requires --segmenter sam3.")
+    p.add_argument("--smart-crop", action="store_true",
+                   help="Hybrid only: extra Sapiens pass on each woman crop. "
+                        "Better arm/leg detail on group photos but very slow "
+                        "on Mac MPS (~20 s per crop). Off by default.")
     args = p.parse_args()
 
     pipe = HairBlurPipeline(
@@ -51,6 +55,7 @@ def main() -> None:
         device=args.device,
         feather_radius=args.feather_radius,
         sam3_version=args.sam3_version,
+        smart_crop=args.smart_crop,
     )
     image = Image.open(args.input).convert("RGB")
     result = pipe(image, blur_radius=args.blur_radius,

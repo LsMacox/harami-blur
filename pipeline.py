@@ -526,7 +526,7 @@ class HybridSegmenter:
                  sam3_version: str = "sam3.1",
                  restrict_to: str = SAM3_MODESTY_RESTRICT_TO,
                  sam3_targets: list[str] | None = None,
-                 smart_crop: bool = True,
+                 smart_crop: bool = False,
                  small_instance_threshold: float = 0.15,
                  crop_padding: float = 0.15,
                  min_crop_side: int = 64,
@@ -709,7 +709,8 @@ class HybridSegmenter:
 
 def build_segmenter(prefer: str = "hybrid", sapiens_size: str = "1b",
                     device: str | None = None,
-                    sam3_version: str = "sam3.1") -> Segmenter:
+                    sam3_version: str = "sam3.1",
+                    smart_crop: bool = False) -> Segmenter:
     """Build a segmenter; cascade through fallbacks on init failure.
 
     Pipeline only has the modesty mode now, so SegFormer (face-only) is
@@ -732,6 +733,7 @@ def build_segmenter(prefer: str = "hybrid", sapiens_size: str = "1b",
                     sapiens_size=sapiens_size,
                     device=device,
                     sam3_version=sam3_version,
+                    smart_crop=smart_crop,
                 )
             if choice == "sam3":
                 return Sam3Segmenter(
@@ -815,10 +817,11 @@ class HairBlurPipeline:
                  device: str | None = None,
                  feather_radius: float = 4.0,
                  sam3_version: str = "sam3.1",
+                 smart_crop: bool = False,
                  mask_cache_size: int = 4):
         self.segmenter = segmenter or build_segmenter(
             prefer_segmenter, sapiens_size, device,
-            sam3_version=sam3_version,
+            sam3_version=sam3_version, smart_crop=smart_crop,
         )
         self.matter = matter or build_matter(prefer_matter, feather_radius)
         # Cache the final (mask, alpha) per image hash. The slow stages —

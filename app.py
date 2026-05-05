@@ -37,10 +37,10 @@ _PIPE_KEY: Optional[tuple] = None
 
 def get_pipeline(sapiens_size: str, segmenter: str, matter: str,
                  device: str, feather_radius: float,
-                 sam3_version: str) -> HairBlurPipeline:
+                 sam3_version: str, smart_crop: bool) -> HairBlurPipeline:
     global _PIPE, _PIPE_KEY
     key = (sapiens_size, segmenter, matter, device,
-           round(feather_radius, 2), sam3_version)
+           round(feather_radius, 2), sam3_version, smart_crop)
     with _PIPE_LOCK:
         if _PIPE is None or _PIPE_KEY != key:
             _PIPE = HairBlurPipeline(
@@ -50,6 +50,7 @@ def get_pipeline(sapiens_size: str, segmenter: str, matter: str,
                 device=device,
                 feather_radius=feather_radius,
                 sam3_version=sam3_version,
+                smart_crop=smart_crop,
             )
             _PIPE_KEY = key
         return _PIPE
@@ -57,6 +58,7 @@ def get_pipeline(sapiens_size: str, segmenter: str, matter: str,
 
 def process(image, blur_radius, segmenter, sapiens_size, sam3_version,
             matter, feather_radius, device_choice, do_clean, check_woman,
+            smart_crop,
             progress=gr.Progress(track_tqdm=False)):
     if image is None:
         raise gr.Error("Сначала загрузите изображение.")
@@ -69,7 +71,7 @@ def process(image, blur_radius, segmenter, sapiens_size, sam3_version,
 
     progress(0.05, desc="Загружаю модели…")
     pipe = get_pipeline(sapiens_size, segmenter, matter, device or "",
-                        feather_radius, sam3_version)
+                        feather_radius, sam3_version, smart_crop)
 
     if check_woman:
         progress(0.2, desc="Проверяю, что на фото женщина…")
@@ -160,6 +162,16 @@ def build_ui() -> gr.Blocks:
                              "(+30 сек на CPU). Если силуэт не найден — "
                              "выводит предупреждение, размытие всё равно "
                              "применяется. Работает только когда сегментатор = sam3.",
+                    )
+                    smart_crop = gr.Checkbox(
+                        value=False,
+                        label="Smart per-person crop (медленно на Mac)",
+                        info="Дополнительный Sapiens-проход по каждому "
+                             "найденному силуэту женщины. Улучшает покрытие "
+                             "рук/ног на групповых фото с маленькими телами, "
+                             "но на Mac MPS каждый кроп идёт ~20 сек "
+                             "(нативно работает только на CUDA). "
+                             "По умолчанию выключено.",
                     )
                     blur_radius = gr.Slider(
                         1, 100, value=25, step=1,
@@ -257,7 +269,8 @@ def build_ui() -> gr.Blocks:
         run_btn.click(
             process,
             inputs=[inp, blur_radius, segmenter, sapiens_size, sam3_version,
-                    matter, feather_radius, device_choice, do_clean, check_woman],
+                    matter, feather_radius, device_choice, do_clean, check_woman,
+                    smart_crop],
             outputs=[out_image, out_mask, out_alpha, info],
         )
 
