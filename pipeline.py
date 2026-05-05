@@ -456,6 +456,219 @@ class Sam3MLXSegmenter:
         return float(mask.mean())
 
 
+# ───────────────────────── SAM 3 / 3.1 via Core ML (Apple Silicon) ──────
+
+DEFAULT_COREML_SAM3_PATH = Path(__file__).parent / "models" / "sam3.1-coreml"
+
+
+class Sam3CoreMLSegmenter:
+    """SAM 3.1 via Core ML on Apple Silicon (CPU + GPU compute units).
+
+    Same public surface as Sam3Segmenter / Sam3MLXSegmenter so HybridSegmenter
+    can use any of the three:
+        get_image_state(image)
+        prompt_mask_and_boxes(image, prompt)
+        segment(image)
+        detect(image, prompt)
+
+    AllanVester/SAM3.1-CoreML-FP16 ships three .mlpackages — image encoder,
+    text encoder, detector — and the pipeline runs them in that order with
+    backbone features cached per image hash and text features cached per
+    prompt. We default `compute_units=CPU_AND_GPU` (skips Apple Neural
+    Engine) because ANE compilation of the ViT image encoder takes ~3.5
+    minutes on first load with no inference-speed benefit on this size.
+    """
+
+    IMAGE_SIZE = 1008
+    MAX_TEXT_LENGTH = 32
+    IMAGE_MEAN = np.array([0.485, 0.456, 0.406], dtype=np.float32)
+    IMAGE_STD = np.array([0.229, 0.224, 0.225], dtype=np.float32)
+
+    def __init__(self,
+                 model_path: str | Path | None = None,
+                 score_threshold: float = 0.3,
+                 state_cache_size: int = 4,
+                 text_cache_size: int = 64,
+                 use_ane: bool = False):
+        try:
+            import coremltools as ct
+        except ImportError as exc:
+            raise RuntimeError(
+                "coremltools not installed. Run:\n  pip install coremltools"
+            ) from exc
+
+        path = Path(model_path) if model_path else DEFAULT_COREML_SAM3_PATH
+        if not (path / "SAM3.1_ImageEncoder_FP16.mlpackage").exists():
+            raise FileNotFoundError(
+                f"Core ML SAM 3.1 not found at {path}. Download with:\n"
+                f"  hf download AllanVester/SAM3.1-CoreML-FP16 "
+                f"--local-dir {path}"
+            )
+
+        self.path = path
+        self.score_threshold = score_threshold
+        self.name = "sam3.1-coreml"
+
+        units = ct.ComputeUnit.ALL if use_ane else ct.ComputeUnit.CPU_AND_GPU
+        log.info(
+            f"loading {self.name} (3 mlpackages, "
+            f"{'with ANE' if use_ane else 'CPU+GPU'})…"
+        )
+        import time as _t
+        t0 = _t.perf_counter()
+        self.image_encoder = ct.models.MLModel(
+            str(path / "SAM3.1_ImageEncoder_FP16.mlpackage"),
+            compute_units=units,
+        )
+        self.text_encoder = ct.models.MLModel(
+            str(path / "SAM3.1_TextEncoder_FP16.mlpackage"),
+            compute_units=units,
+        )
+        self.detector = ct.models.MLModel(
+            str(path / "SAM3.1_Detector_FP16.mlpackage"),
+            compute_units=units,
+        )
+        log.info(f"{self.name} loaded in {_t.perf_counter() - t0:.1f}s")
+
+        from transformers import CLIPTokenizer
+        self.tokenizer = CLIPTokenizer.from_pretrained("openai/clip-vit-base-patch32")
+
+        self._image_cache: dict[str, dict] = {}
+        self._image_cache_lock = threading.Lock()
+        self._image_cache_max = state_cache_size
+        self._text_cache: dict[str, tuple] = {}
+        self._text_cache_lock = threading.Lock()
+        self._text_cache_max = text_cache_size
+
+    def _preprocess_image(self, image: Image.Image) -> np.ndarray:
+        img = image.convert("RGB").resize(
+            (self.IMAGE_SIZE, self.IMAGE_SIZE), Image.BILINEAR,
+        )
+        arr = (np.asarray(img, dtype=np.float32) / 255.0 - self.IMAGE_MEAN) / self.IMAGE_STD
+        # Core ML wants (1, 3, H, W) channels-first; auto-converts fp32→fp16.
+        return arr.transpose(2, 0, 1)[None].astype(np.float32)
+
+    def _tokenize(self, text: str) -> np.ndarray:
+        encoded = self.tokenizer(
+            [text],
+            padding="max_length",
+            max_length=self.MAX_TEXT_LENGTH,
+            truncation=True,
+            return_tensors="np",
+        )
+        return encoded["input_ids"].astype(np.int32)
+
+    def get_image_state(self, image: Image.Image) -> dict:
+        """Encode ViT once per unique image; cached by content hash."""
+        h = image_content_hash(image)
+        with self._image_cache_lock:
+            cached = self._image_cache.get(h)
+            if cached is not None:
+                log.info(f"sam3-coreml image cache hit ({h[:8]})")
+                return cached
+        log.info(f"sam3-coreml encoding image ({h[:8]})…")
+        pixel_values = self._preprocess_image(image)
+        out = self.image_encoder.predict({"image": pixel_values})
+        state = {
+            "fpn_feat0": out["x_495"],
+            "fpn_feat1": out["x_497"],
+            "fpn_feat2": out["x_499"],
+            "vis_pos": out["const_762"],
+            "size": image.size,
+        }
+        with self._image_cache_lock:
+            if len(self._image_cache) >= self._image_cache_max:
+                self._image_cache.pop(next(iter(self._image_cache)))
+            self._image_cache[h] = state
+        return state
+
+    def _get_text_features(self, prompt: str) -> tuple[np.ndarray, np.ndarray]:
+        """Tokenize + encode text. Cached per prompt (the same modesty
+        prompts repeat across every photo)."""
+        with self._text_cache_lock:
+            cached = self._text_cache.get(prompt)
+            if cached is not None:
+                return cached
+        token_ids = self._tokenize(prompt)
+        out = self.text_encoder.predict({"token_ids": token_ids})
+        feat = (out["var_2489"], out["var_5"].astype(np.float32))
+        with self._text_cache_lock:
+            if len(self._text_cache) >= self._text_cache_max:
+                self._text_cache.pop(next(iter(self._text_cache)))
+            self._text_cache[prompt] = feat
+        return feat
+
+    def prompt_mask_and_boxes(
+        self, image: Image.Image, prompt: str,
+    ) -> tuple[np.ndarray, list[tuple[int, int, int, int]]]:
+        state = self.get_image_state(image)
+        text_features, text_mask = self._get_text_features(prompt)
+        det = self.detector.predict({
+            "fpn_feat0": state["fpn_feat0"],
+            "fpn_feat1": state["fpn_feat1"],
+            "fpn_feat2": state["fpn_feat2"],
+            "vis_pos": state["vis_pos"],
+            "text_features": text_features,
+            "text_mask": text_mask,
+        })
+        boxes = det["var_4734"][0]   # (200, 4) cxcywh normalized
+        scores = det["var_4806"][0]  # (200,) already in [0, 1]
+        masks = det["var_5020"][0]   # (200, 288, 288) logits
+
+        h, w = image.height, image.width
+        union = np.zeros((h, w), dtype=bool)
+        boxes_out: list[tuple[int, int, int, int]] = []
+
+        keep_idx = np.where(scores > self.score_threshold)[0]
+        for i in keep_idx:
+            # Mask: logits → sigmoid → resize → binary
+            mask_logits = masks[i].astype(np.float32)
+            mask_prob = 1.0 / (1.0 + np.exp(-mask_logits))
+            mask_pil = Image.fromarray((mask_prob * 255).astype(np.uint8)).resize(
+                (w, h), Image.BILINEAR,
+            )
+            union |= np.asarray(mask_pil) > 127
+
+            # Box: cxcywh normalized → xyxy pixel
+            cx, cy, bw, bh = (float(v) for v in boxes[i])
+            x1 = (cx - bw / 2) * w
+            y1 = (cy - bh / 2) * h
+            x2 = (cx + bw / 2) * w
+            y2 = (cy + bh / 2) * h
+            boxes_out.append((
+                int(round(max(0, min(w, x1)))),
+                int(round(max(0, min(h, y1)))),
+                int(round(max(0, min(w, x2)))),
+                int(round(max(0, min(h, y2)))),
+            ))
+        return union, boxes_out
+
+    def segment(self, image: Image.Image,
+                targets: list[str] | None = None,
+                restrict_to: str | None = None) -> np.ndarray:
+        if targets is None:
+            targets = list(SAM3_MODESTY_TARGETS)
+        if restrict_to is None:
+            restrict_to = SAM3_MODESTY_RESTRICT_TO
+        h, w = image.height, image.width
+        union = np.zeros((h, w), dtype=bool)
+        for prompt in targets:
+            log.info(f"sam3-coreml target: {prompt!r}")
+            mask, _ = self.prompt_mask_and_boxes(image, prompt)
+            union |= mask
+        if restrict_to:
+            log.info(f"sam3-coreml restriction: {restrict_to!r}")
+            r, _ = self.prompt_mask_and_boxes(image, restrict_to)
+            if r.mean() < 1e-4:
+                return np.zeros((h, w), dtype=np.uint8)
+            union &= r
+        return union.astype(np.uint8) * 255
+
+    def detect(self, image: Image.Image, prompt: str) -> float:
+        mask, _ = self.prompt_mask_and_boxes(image, prompt)
+        return float(mask.mean())
+
+
 # ───────────────────────── Sapiens segmenter ─────────────────────────
 
 SAPIENS_INPUT_H, SAPIENS_INPUT_W = 1024, 768
@@ -818,10 +1031,22 @@ def _build_body_segmenter(backend: str, sapiens_size: str,
 
 def _build_sam3_segmenter(backend: str, sam3_version: str,
                           device: str | None,
-                          mlx_model_path: str | Path | None = None):
-    """SAM 3 backend selector. Order: MLX (fast on Apple Silicon) →
-    PyTorch (CPU-only on Mac, slow but always works once weights are
-    downloaded)."""
+                          mlx_model_path: str | Path | None = None,
+                          coreml_model_path: str | Path | None = None):
+    """SAM 3 backend selector.
+
+    Cascade:
+      coreml — fastest on Apple Silicon (~2.4 s encode on CPU+GPU)
+      mlx    — Apple Silicon native via mlx-vlm (~3 s encode)
+      pytorch — CPU only on Mac (~25 s encode)
+    On unknown / unsupported backends we fall through to the next.
+    """
+    if backend == "coreml":
+        try:
+            return Sam3CoreMLSegmenter(model_path=coreml_model_path)
+        except Exception as e:
+            log.warning(f"Core ML SAM 3 unavailable ({e}); trying MLX")
+            backend = "mlx"
     if backend == "mlx":
         try:
             return Sam3MLXSegmenter(model_path=mlx_model_path)
@@ -849,14 +1074,15 @@ class HybridSegmenter:
 
     def __init__(self,
                  body_backend: str = "atr",
-                 sam3_backend: str = "mlx",
+                 sam3_backend: str = "coreml",
                  sapiens_size: str = "1b",
                  device: str | None = None,
                  sam3_version: str = "sam3.1",
                  mlx_model_path: str | Path | None = None,
+                 coreml_model_path: str | Path | None = None,
                  restrict_to: str = SAM3_MODESTY_RESTRICT_TO,
                  sam3_targets: list[str] | None = None,
-                 smart_crop: bool = False,
+                 smart_crop: bool = True,
                  small_instance_threshold: float = 0.15,
                  crop_padding: float = 0.15,
                  min_crop_side: int = 64,
@@ -868,7 +1094,9 @@ class HybridSegmenter:
         self.sam3_targets: list[str] = sam3_targets
         # The chosen SAM 3 backend exposes prompt_mask_and_boxes(image, prompt).
         self.sam3 = _build_sam3_segmenter(
-            sam3_backend, sam3_version, device, mlx_model_path,
+            sam3_backend, sam3_version, device,
+            mlx_model_path=mlx_model_path,
+            coreml_model_path=coreml_model_path,
         )
         self.restrict_to = restrict_to
         self.smart_crop = smart_crop
@@ -1009,14 +1237,16 @@ class HybridSegmenter:
 def build_segmenter(prefer: str = "hybrid", sapiens_size: str = "1b",
                     device: str | None = None,
                     sam3_version: str = "sam3.1",
-                    smart_crop: bool = False,
+                    smart_crop: bool = True,
                     body_backend: str = "atr",
-                    sam3_backend: str = "mlx",
-                    mlx_model_path: str | Path | None = None) -> Segmenter:
+                    sam3_backend: str = "coreml",
+                    mlx_model_path: str | Path | None = None,
+                    coreml_model_path: str | Path | None = None) -> Segmenter:
     """Build a segmenter; cascade through fallbacks on init failure.
 
     body_backend  — "atr" (~80M, ~0.2 s on MPS) or "sapiens" (~4 GB, ~12 s)
-    sam3_backend  — "mlx" (Apple Silicon native) or "pytorch" (CPU only)
+    sam3_backend  — "coreml" (Apple Silicon, ~2.4 s encode), "mlx"
+                    (~3 s), or "pytorch" (CPU only on Mac, ~25 s)
     """
     if prefer == "hybrid":
         chain = ["hybrid", "sam3", "atr", "sapiens"]
@@ -1040,11 +1270,14 @@ def build_segmenter(prefer: str = "hybrid", sapiens_size: str = "1b",
                     device=device,
                     sam3_version=sam3_version,
                     mlx_model_path=mlx_model_path,
+                    coreml_model_path=coreml_model_path,
                     smart_crop=smart_crop,
                 )
             if choice == "sam3":
                 return _build_sam3_segmenter(
-                    sam3_backend, sam3_version, device, mlx_model_path,
+                    sam3_backend, sam3_version, device,
+                    mlx_model_path=mlx_model_path,
+                    coreml_model_path=coreml_model_path,
                 )
             if choice == "atr":
                 return SegformerATRSegmenter(device=device)
@@ -1121,16 +1354,18 @@ class HairBlurPipeline:
                  device: str | None = None,
                  feather_radius: float = 4.0,
                  sam3_version: str = "sam3.1",
-                 smart_crop: bool = False,
+                 smart_crop: bool = True,
                  body_backend: str = "atr",
-                 sam3_backend: str = "mlx",
+                 sam3_backend: str = "coreml",
                  mlx_model_path: str | Path | None = None,
+                 coreml_model_path: str | Path | None = None,
                  mask_cache_size: int = 4):
         self.segmenter = segmenter or build_segmenter(
             prefer_segmenter, sapiens_size, device,
             sam3_version=sam3_version, smart_crop=smart_crop,
             body_backend=body_backend, sam3_backend=sam3_backend,
             mlx_model_path=mlx_model_path,
+            coreml_model_path=coreml_model_path,
         )
         self.matter = matter or build_matter(prefer_matter, feather_radius)
         # Cache the final (mask, alpha) per image hash. The slow stages —
