@@ -946,9 +946,27 @@ class SegFormerSegmenter:
 # ───────────────────────── MatAnyone matter ─────────────────────────
 
 class MatAnyoneMatter:
-    def __init__(self):
+    def __init__(self, n_warmup: int = 1):
+        """
+        n_warmup: how many iterations MatAnyone runs on the (single) input
+            frame before producing the alpha. Designed for video to let the
+            matte stabilize across frames; for a static image it's mostly
+            wasted work. Empirical sweep on a 800×1200 portrait:
+
+                n_warmup  time   mean(|alpha - alpha_n10|)
+                0         0.6 s  0.74 %
+                1         0.9 s  0.53 %
+                3         1.6 s  0.36 %
+                5         2.4 s  0.28 %
+                10        4.4 s  baseline (matanyone default)
+
+            The original `n_warmup=10` cost an extra ~3.5 s per cold
+            pipeline run for an alpha that visually rounded to the same
+            blur. We default to 1 here.
+        """
         from matanyone import InferenceCore  # noqa: F401  (early import-check)
-        self.name = "matanyone"
+        self.n_warmup = n_warmup
+        self.name = f"matanyone-w{n_warmup}"
         self._core_cls = InferenceCore
         self._core = None
 
@@ -978,7 +996,7 @@ class MatAnyoneMatter:
                 input_path=str(frames_dir),
                 mask_path=str(mask_path),
                 output_path=str(out_dir),
-                n_warmup=10,
+                n_warmup=self.n_warmup,
                 save_image=True,
             )
             alpha_pngs = sorted((out_dir / "frames" / "pha").glob("*.png"))
