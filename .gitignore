@@ -18,3 +18,9 @@ test/out_sam3_1.jpg
 test/out_sam3_1_cpu.jpg
 test/mask_*.png
 test/alpha_*.png
+
+# Local model checkpoints (big — keep out of git)
+models/
+*.safetensors
+*.pt
+*.pt2

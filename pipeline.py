@@ -530,7 +530,8 @@ class HybridSegmenter:
                  small_instance_threshold: float = 0.15,
                  crop_padding: float = 0.15,
                  min_crop_side: int = 64,
-                 max_crops_per_batch: int = 16):
+                 max_crops_per_batch: int = 4,
+                 max_total_crops: int = 24):
         self.body = SapiensSegmenter(
             size=sapiens_size,
             device=device,
@@ -554,6 +555,7 @@ class HybridSegmenter:
         self.crop_padding = crop_padding
         self.min_crop_side = min_crop_side
         self.max_crops_per_batch = max_crops_per_batch
+        self.max_total_crops = max_total_crops
         self.name = (
             f"hybrid:{self.body.name}"
             f"+{self.sam3.version}:{'+'.join(sam3_targets)}"
@@ -635,17 +637,42 @@ class HybridSegmenter:
         result = np.zeros((H, W), dtype=np.uint8)
         if not crops_to_process:
             return result
-        log.info(f"smart-crop: {len(crops_to_process)} small instances")
 
-        # Batch through Sapiens in chunks (avoid OOM on huge groups).
+        # Hard cap so a 50-person photo doesn't tie up the GPU for minutes.
+        # Pick the largest instances first — small thumbnail-sized blobs are
+        # the least useful to refine anyway.
+        if len(crops_to_process) > self.max_total_crops:
+            log.info(
+                f"smart-crop: {len(crops_to_process)} candidates, "
+                f"capping to {self.max_total_crops} largest"
+            )
+            crops_to_process.sort(
+                key=lambda c: (c[2] - c[0]) * (c[3] - c[1]), reverse=True,
+            )
+            crops_to_process = crops_to_process[:self.max_total_crops]
+
+        log.info(
+            f"smart-crop: {len(crops_to_process)} crops, "
+            f"batch={self.max_crops_per_batch}"
+        )
+
+        # Batch through Sapiens in chunks (avoid OOM on MPS / huge groups).
+        import time as _time
+        t0 = _time.perf_counter()
         for i in range(0, len(crops_to_process), self.max_crops_per_batch):
             chunk = crops_to_process[i:i + self.max_crops_per_batch]
+            tb = _time.perf_counter()
             crop_imgs = [c[4] for c in chunk]
             crop_masks = self.body.segment_batch(crop_imgs)
             for (cx1, cy1, cx2, cy2, _img), cmask in zip(chunk, crop_masks):
                 result[cy1:cy2, cx1:cx2] = np.maximum(
                     result[cy1:cy2, cx1:cx2], cmask
                 )
+            log.info(
+                f"smart-crop batch {i // self.max_crops_per_batch + 1}: "
+                f"{len(chunk)} crops in {(_time.perf_counter() - tb):.1f}s"
+            )
+        log.info(f"smart-crop total: {(_time.perf_counter() - t0):.1f}s")
         return result
 
     def segment(self, image: Image.Image) -> np.ndarray:
